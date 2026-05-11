@@ -1,8 +1,13 @@
-# ITParkHackathon — детекция фрода в банковских операциях
+# AntiFraudMLWeb — детекция фрода в веб-сессиях банка
 
 ## Задача
 
-Бинарная классификация: для каждого события (банковской транзакции) предсказать `target ∈ {0, 1}` — была ли операция неподтверждённой (фрод). Результат отправляется как CSV в формате `event_id, predict` (raw logit или другой непрерывный скор).
+Бинарная классификация: для каждого события (банковской операции) предсказать
+`target ∈ {0, 1}` — фрод или нет. Submission — CSV в формате
+`event_id, predict` (raw logit или произвольный непрерывный скор).
+
+Целевая схема — **71 столбец** из `task.md`: web-fraud (browser identity,
+mouse / keyboard биометрия, network, fingerprints, login/trust).
 
 ## Структура данных
 
@@ -11,15 +16,20 @@
 | Файл | Период | Размер | Что |
 |---|---|---:|---|
 | `pretrain_part_{1,2,3}.parquet` | 2023-10-01 — 2024-09-30 | ~625 MB × 3 | Только операции, без меток |
-| `train_part_{1,2,3}.parquet` | 2024-10-01 — 2025-05-31 | ~688 MB × 3 | Операции + есть метки в отдельном файле |
+| `train_part_{1,2,3}.parquet` | 2024-10-01 — 2025-05-31 | ~688 MB × 3 | Операции + метки в отдельном файле |
 | `pretest.parquet` | 2025-06-01 — 2025-08-09 | 339 MB | История тестовых клиентов перед последним днём |
-| `test.parquet` | 2025-06-01 — 2025-08-09 | 17 MB | Финальный день тестовых клиентов — здесь нужно предсказать target |
+| `test.parquet` | 2025-06-01 — 2025-08-09 | 17 MB | Финальный день тестовых клиентов |
 | `train_labels.parquet` | — | 1.2 MB | 87 514 пар `(customer_id, event_id) → target` |
 | `sample_submit.csv` | — | 22 MB | Формат submission'а: `event_id, predict` |
 
-### Схема исходных событий (23 колонки)
+### Схема исходных событий (23 колонки в `data/`)
 
-`customer_id (int64), event_id (int64), event_dttm (str datetime), event_type_nm, event_desc, channel_indicator_type, channel_indicator_sub_type, operaton_amt, currency_iso_cd, mcc_code, pos_cd, accept_language, browser_language, timezone, session_id (int64, частично NULL), operating_system_type, battery (str), device_system_version, screen_size (str), developer_tools, phone_voip_call_state, web_rdp_connection, compromised`.
+`customer_id, event_id, event_dttm, event_type_nm, event_desc,
+channel_indicator_type, channel_indicator_sub_type, operaton_amt,
+currency_iso_cd, mcc_code, pos_cd, accept_language, browser_language,
+timezone, session_id (часто NULL в pretrain), operating_system_type,
+battery, device_system_version, screen_size, developer_tools,
+phone_voip_call_state, web_rdp_connection, compromised`.
 
 **Важно:** `session_id` заполнен неравномерно:
 - pretrain_part_*: **0%** (везде NULL)
@@ -27,7 +37,8 @@
 - pretest: ~64%
 - test: ~66%
 
-Это причина первого бага в `feature_generator` (см. ниже).
+Поэтому в `feature_generator` есть fallback: при NULL `session_id` подставляется
+`event_id` (иначе все session-keyed фичи коллапсируют в одну константу).
 
 ### Объёмы
 
@@ -38,52 +49,95 @@
 ## Что построено
 
 ```
-ITParkHackathon/
+AntiFraudMLWeb/
 ├── data/                          # Исходные parquet'ы (не трогаем)
-├── data_augmented/                # Парные файлы + дополнительные артефакты
-│   ├── *.parquet                  # 8 augmented файлов (23 + 13 = 36 колонок)
-│   ├── customer_features.parquet  # 100 K клиентов × 23 агрегата
+├── data_augmented/                # 8 augmented файлов (71 task.md колонка)
+│   ├── *.parquet
+│   ├── customer_features.parquet  # 100 K клиентов × 47 агрегатов
 │   └── labelled_events.parquet    # 87 514 размеченных событий с фичами
-├── feature_generator/             # Этап 1: добавление 13 синтетических признаков
+├── feature_generator/             # Этап 1: 71-колоночная task.md схема
 ├── trainer/                       # Этап 2: обучение MLP
 │   ├── checkpoints/
-│   │   ├── best.pt                # 313 KB — лучшая модель + препроцессор
-│   │   └── metrics.json           # История метрик по эпохам
+│   │   ├── best.pt                # чекпоинт + pickled preprocessor
+│   │   └── metrics.json           # история метрик
 │   └── ...
 ├── predict_example.py             # Пример инференса — пишет submission.csv
+├── predict_from_json.py           # Инференс по JSON-массиву событий
+├── predict_input_example.json     # Демо payload (web-fraud схема)
+├── test1.json / test2_new_customer.json / test3_collision.json  # тесты
 ├── submission.csv                 # Результат инференса по test.parquet
-├── DATA.md                        # Описание данных (от организаторов)
+├── task.md                        # ЦЕЛЕВАЯ схема (71 колонка)
+├── DATA.md                        # Описание исходных данных
 └── CLAUDE.md                      # Этот файл
 ```
 
 ## Этап 1 — feature_generator
 
-Генерирует 13 поведенческих/устройство-интегритетных признаков и записывает их рядом с исходными колонками в `data_augmented/`.
+Генерирует web-fraud признаки и записывает **только 71 колонку task.md**
+(старые исходные колонки в augmented parquet не сохраняются).
 
-### 13 признаков
+### 71 колонка task.md (по группам)
 
-| Колонка | Тип | Ключ | Назначение |
-|---|---|---|---|
-| `attestation_status` | str | customer_id | passed/failed_root/emulator/modified_firmware |
-| `app_background_events` | int32 | session_id | сворачивания во время заполнения формы |
-| `clipboard_paste_ratio_mobile` | float32 [0,1] | session_id | доля вставок из буфера |
-| `entry_source` | str | event_id | manual/push/deeplink/sms_link |
-| `connection_type` | str | session_id | wifi_home/cellular/wifi_public/vpn/tor |
-| `touch_typing_rhythm` | float32 | session_id | коэффициент вариации интервалов нажатий (бот → ~0) |
-| `sim_country_mismatch` | int8 | customer_id | флаг расхождения страны SIM/IP/TZ |
-| `network_rtt_avg` | float32 (ms) | session_id | средний сетевой RTT |
-| `biometric_entry_used` | int8 | customer_id + event_id | FaceID/TouchID |
-| `storage_free_percent` | float32 | customer_id + event_id | свободное место |
-| `battery_charging_state` | str | event_id | discharging/charging/full/plugged_24_7 |
-| `screen_orientation_changes` | int32 | session_id | смены ориентации (RDP/демонстрация) |
-| `debugger_attached` | int8 | event_id | Frida/Xposed-инъекции |
+**Identity / passthrough из source:** `customer_id`, `event_id`,
+`session_id` (с fallback на `event_id` при NULL), `event_dttm`,
+`operaton_amt`, `currency_iso_cd`, `mcc_code`, `pos_cd`,
+`browser_language`, `accept_language`.
+
+**Browser identity** (per-customer стабильно): `browser_fingerprint`,
+`user_agent`, `browser_name`, `browser_version`, `os_type`,
+`os_version`, `screen_resolution`, `screen_color_depth`,
+`system_language`, `webgl_vendor`, `canvas_fingerprint`,
+`audio_fingerprint`.
+
+**Privacy / security флаги** (event/session, risk-biased):
+`is_developer_tools`, `is_headless_browser`, `is_incognito`,
+`is_vpn_detected`, `is_proxy_detected`, `is_tor_detected`.
+
+**Network** (per-session): `ip_address_hash`, `connection_type`,
+`network_rtt_avg_ms`, `asn`, `isp_name`.
+
+**Mouse биометрика** (per-session, бот-bias под высокий risk):
+`mouse_velocity_avg`, `mouse_acceleration_avg`, `mouse_jitter_score`,
+`mouse_linearity_score`.
+
+**Click / scroll:** `click_duration_avg_ms`, `right_click_count`,
+`scroll_velocity_avg`, `double_click_count`.
+
+**Keyboard биометрика:** `keyboard_typing_speed_median_ms`,
+`keyboard_typing_speed_std_dev`, `keyboard_typing_rhythm_cv`.
+
+**Form interactions** (per-session): `backspace_ratio`,
+`clipboard_paste_ratio`, `copy_events_count`, `paste_events_count`,
+`tab_switch_count`, `focus_blur_count`, `form_fill_duration_sec`,
+`idle_time_before_submit_sec`, `error_correction_ratio`,
+`hover_time_avg_ms`, `drag_drop_events`, `resize_events_count`,
+`zoom_level`.
+
+**Session shape:** `session_duration_sec`, `pages_visited_count`.
+
+**Login / trust** (per-customer + per-event): `login_method`,
+`failed_login_attempts`, `time_since_last_login_sec`, `is_new_device`,
+`is_new_browser`, `device_trust_score`.
+
+**Temporal** (из `event_dttm`): `hour_of_day`, `day_of_week`,
+`timezone_offset`.
+
+**Transaction enrichment:** `merchant_name`, `transaction_type`.
 
 ### Дизайн генератора
 
-- **Детерминированность:** все случайные значения — SplitMix64-хеш от `(int_key, salt, seed)`, где key — `customer_id`, `session_id` или `event_id` в зависимости от семантики признака. Перезапуск с тем же seed → побитово идентичный parquet.
-- **Class-conditional bias:** для train-файлов левый join с `train_labels.parquet`. Если target известен — risk = 0.85 (фрод) или 0.10 (норма); если нет — risk вычисляется из существующих флагов `compromised`, `developer_tools`, `web_rdp_connection`, `phone_voip_call_state`.
-- **Параметры распределений** линейно интерполируются между benign- и fraud-вариантами по risk.
-- **Fallback для пустого session_id:** там, где `session_id` NULL (особенно pretrain — 100% null), вместо `0` подставляется `event_id`. Иначе все session-keyed признаки коллапсируют в одну константу для всего pretrain. **Это был баг первой версии — починен.**
+- **Детерминированность:** SplitMix64-хеш от `(int_key, salt, seed)`. Ключ —
+  `customer_id`, `session_id` или `event_id` в зависимости от семантики.
+  Перезапуск с тем же seed → побитово идентичный parquet.
+- **Class-conditional bias:** для train-файлов левый join с
+  `train_labels.parquet`. Если target известен — risk = 0.85 (фрод) или 0.10
+  (норма); иначе risk вычисляется из source-флагов (`compromised`,
+  `developer_tools`, `web_rdp_connection`, `phone_voip_call_state`).
+- **Параметры распределений** линейно интерполируются между benign- и
+  fraud-вариантами по risk. Бинарные флаги — `Bernoulli(lerp(p_benign, p_fraud, r))`.
+- **Source passthrough:** `os_type` / `os_version` / `screen_resolution` /
+  `timezone_offset` / `browser_language` / `accept_language` берутся из
+  исходных колонок если они есть, иначе генерируются.
 
 ### Запуск
 
@@ -94,21 +148,25 @@ python3 -m feature_generator.cli --files test.parquet
 
 ### Что важно знать про эти признаки
 
-13 признаков сгенерированы **conditionально на target** (где он известен) и **на существующие риск-флаги** (везде). Это значит:
-- Они **очень сильный сигнал** для модели — на размеченной выборке любая разумная архитектура даст AUC≈1.0.
-- На реальных данных, где такие сигналы должны измеряться датчиками, корреляция будет на порядок слабее.
-- Это **не баг, а цель**: пользователь явно попросил «class-conditional bias, чтобы признаки были полезны для обучения NN».
+Признаки сгенерированы **conditionально на target** (где он известен) и
+**на source risk-флаги** (везде). Это значит:
+- Они **очень сильный сигнал** для модели — на размеченной выборке любая
+  разумная архитектура даст AUC≈1.0.
+- На реальных web-сессиях, где такие сигналы должны измеряться
+  фронтовыми SDK / fingerprinting JS, корреляция будет слабее.
+- Это **не баг, а цель**: для baseline нужны полезные для NN признаки.
 
 ## Этап 2 — trainer
 
-Обучает бинарный классификатор (PyTorch MLP) на 87 514 размеченных событиях с обогащением 23 агрегатами по истории клиента.
+Обучает бинарный классификатор (PyTorch MLP) на 87 514 размеченных событиях
+с обогащением 47 агрегатами по истории клиента.
 
 ### Пайплайн
 
 ```
 data_augmented/*.parquet
-   ├── aggregate ───► customer_features.parquet (100 K × 23 фичи)
-   └── extract  ───► labelled_events.parquet  (87 K × 36 + target)
+   ├── aggregate ───► customer_features.parquet (100 K × 47 фичей)
+   └── extract  ───► labelled_events.parquet  (87 K × 71 + target)
                           │
                           ▼
                    Preprocessor (vocab + z-score)
@@ -123,27 +181,62 @@ data_augmented/*.parquet
 
 ### Архитектура модели
 
-- 16 категориальных колонок → эмбеддинги размера `min(32, ⌈√vocab⌉)`. Cardinality cap = 1024 с бакетом OTHER.
-- 16 числовых → z-score (mean/std из train-сплита, NaN → 0).
-- 23 агрегата → z-score.
+- 19 категориальных колонок → эмбеддинги `min(32, ⌈√vocab⌉)`. Cardinality cap = 1024 с бакетом OTHER.
+- 44 числовые → z-score (mean/std из train-сплита, NaN → 0).
+- 47 агрегатов → z-score.
 - `has_history` (0/1) — флаг наличия агрегатов для клиента.
 - Конкатенация → Linear(IN, 256) + BN + ReLU + Dropout(0.3) → Linear(256, 128) + BN + ReLU + Dropout(0.3) → Linear(128, 64) + ReLU → Linear(64, 1).
 - Loss: `BCEWithLogitsLoss(pos_weight = n_neg / n_pos)`.
 - Optimizer: AdamW(lr=1e-3, wd=1e-4), CosineAnnealingLR.
 
+### Что нумерик / что категориал
+
+**Numeric (44):** `operaton_amt` (log1p), все `is_*` флаги, производный
+`biometric_login` (из `login_method == 'biometric'`), все
+mouse/click/scroll/keyboard/form-метрики, session-shape, login-trust,
+`network_rtt_avg_ms`, `screen_color_depth`, `installed_fonts_count`,
+`timezone_offset`, `asn`.
+
+**Categorical (19):** `currency_iso_cd`, `mcc_code`, `pos_cd`,
+`browser_name`, `browser_version`, `os_type`, `os_version`,
+`screen_resolution`, `system_language`, `browser_language`,
+`accept_language`, `merchant_name`, `transaction_type`,
+`connection_type`, `isp_name`, `webgl_vendor`, `login_method`,
+`hour_of_day`, `day_of_week`.
+
 ### Cold-start через aggregate dropout
 
-В 20% обучающих сэмплов агрегаты обнуляются и `has_history=0`. Это учит модель работать без истории клиента — нужно для production на новых клиентах, которых нет в `customer_features.parquet`. При инференсе клиенты без агрегатов автоматически получают нули + `has_history=0`.
+В 20% обучающих сэмплов агрегаты обнуляются и `has_history=0`. Это учит модель
+работать без истории клиента (для новых клиентов, которых нет в
+`customer_features.parquet`). При инференсе клиенты без агрегатов получают
+нули + `has_history=0`.
 
-### 23 агрегата по клиенту
+### 47 агрегатов по клиенту
 
-`event_count`, `amt_mean/std/max/log_mean`, `compromised_share`, `web_rdp_share`, `developer_tools_share`, `phone_voip_share`, `mean_app_background_events`, `mean_clipboard_paste`, `mean_typing_rhythm`, `mean_rtt`, `mean_storage_free`, `mean_screen_orientation`, `biometric_share`, `debugger_share`, `sim_mismatch_share`, `attestation_failed_share`, `vpn_tor_share`, `hours_span`, `night_ops_share`, `weekend_share`.
+`event_count`, `amt_mean/std/max/log_mean`, `dev_tools_share`, `headless_share`,
+`incognito_share`, `vpn_share`, `proxy_share`, `tor_share`,
+`new_device_share`, `new_browser_share`, `mean_rtt`,
+`mean_mouse_velocity/accel/jitter/linearity`, `mean_click_duration`,
+`mean_right_clicks`, `mean_scroll_velocity`, `mean_typing_median_ms/std/cv`,
+`mean_backspace`, `mean_clipboard_paste`, `mean_copy_events/paste_events`,
+`mean_tab_switch`, `mean_focus_blur`, `mean_form_fill`,
+`mean_idle_before_submit`, `mean_error_correction`, `mean_hover_time`,
+`mean_double_click`, `mean_drag_drop`, `mean_resize_events`,
+`mean_zoom_level`, `mean_session_duration`, `mean_pages_visited`,
+`mean_installed_fonts`, `mean_failed_logins`, `mean_time_since_login`,
+`mean_device_trust`, `foreign_isp_share`, `mobile_os_share`, `hours_span`,
+`night_ops_share`, `weekend_share`.
 
-Считаются по объединению pretrain + train + pretest (108 M строк), потоково в батчах 200 K строк. Накопитель — pandas DataFrame, `add(..., fill_value=0)` после каждого groupby.
+Считаются по объединению pretrain + train + pretest (108 M строк), потоково в
+батчах 200 K строк. Накопитель — pandas DataFrame, `add(..., fill_value=0)`
+после каждого groupby.
 
 ### Известная утечка
 
-Агрегаты по клиенту считаются по всему историческому набору, **включая** размеченные события. Метки сами не утекают (label-only поле не агрегируется), но синтетические признаки уже зависели от target, поэтому `attestation_failed_share`, `debugger_share`, и т.д. сильно коррелируют с долей фрода клиента. Это вместе с conditional-генерацией событийных признаков даёт AUC=1.0 — **по плану**, для baseline это приемлемо.
+Агрегаты по клиенту считаются по всему историческому набору, **включая**
+размеченные события. Метки не утекают напрямую (только их хеш-производные —
+синтетические фичи зависят от target). Это даёт AUC=1.0 — **по плану**,
+для baseline приемлемо.
 
 ### Запуск
 
@@ -151,46 +244,77 @@ data_augmented/*.parquet
 python3 -m trainer.cli all          # aggregate → extract → train (~12 минут)
 python3 -m trainer.cli aggregate    # только агрегация (~10 минут)
 python3 -m trainer.cli extract      # только извлечение размеченных (~2 минуты)
-python3 -m trainer.cli train --epochs 20 --batch-size 4096   # только обучение (~45 с на RTX 4060)
+python3 -m trainer.cli train --epochs 20 --batch-size 4096   # только обучение
 ```
 
-### Текущий результат
+## Этап 3 — predict
 
-20 эпох на RTX 4060 Laptop = 43.6 с. val AUC = 1.0 со 1-й эпохи (см. «известная утечка»), val_loss падает до 0.00017.
+Два сценария:
 
-## Этап 3 — predict_example.py
-
-Демонстрация использования модели:
-1. Загружает `best.pt`, восстанавливает `Preprocessor` из pickle.
-2. Batch-инференс по `test.parquet` → `submission.csv` (633 683 строки).
-3. Одиночное предсказание по словарю-событию (для иллюстрации API).
+### Batch — `predict_example.py`
 
 ```bash
 python3 predict_example.py
 ```
 
+1. Загружает `best.pt`, восстанавливает `Preprocessor` из pickle.
+2. Batch-инференс по `data_augmented/test.parquet` → `submission.csv`.
+3. Demo: пара hardcoded событий (фрод vs норма) по task.md схеме.
+
+### JSON — `predict_from_json.py`
+
+```bash
+python3 predict_from_json.py predict_input_example.json
+```
+
+Читает `{"events": [...]}` JSON. Каждое событие — словарь с полями task.md
+схемы. Печатает `logit`, `P(fraud)`, `has_history`, время инференса.
+
+Готовые payload-файлы для проверки модели:
+
+- `predict_input_example.json` — базовая пара fraud / benign.
+- `test1.json` — известный клиент, контрольная пара.
+- `test2_new_customer.json` — cold-start (нет в `customer_features.parquet`).
+- `test3_collision.json` — «чистый» клиент с подозрительным событием
+  (проверка, перетягивает ли история вердикт).
+
 ## Окружение
 
 - Python 3.14, pandas 3.0.1, pyarrow 23.0.1, numpy 2.4.4, torch 2.9.1+cu130
 - GPU: NVIDIA RTX 4060 Laptop, 8.2 GB VRAM, CUDA available
-- Project root: `/home/clever/Documents/ITParkHackathon`
+- Project root: `/home/clever/Documents/AntiFraud/AntiFraudMLWeb`
 - Никаких внешних БД нет — всё на parquet'ах в файловой системе
 
 ## Подводные камни (gotchas)
 
-1. **pandas 3.0 datetime resolution = microseconds** по умолчанию, не nanoseconds. В `aggregate.py:_prepare_batch` конвертация в секунды через `dt.astype("datetime64[s]").view("int64")` — устойчиво к обеим резолюциям.
-2. **`Series.view` удалён в pandas 3.0** — использовать `to_numpy().view(...)` или `astype(...)`.
-3. **`session_id` в pretrain 100% NULL** — fallback к `event_id` обязателен, иначе все session-keyed фичи коллапсируют.
-4. **Тип чекпоинта при загрузке:** `torch.load(..., weights_only=False)` нужен, потому что в чекпоинте лежит pickled-препроцессор (произвольный объект).
-5. **AUC=1.0 не баг.** Это следствие того, что синтетические фичи генерируются conditional на target. Чтобы проверить event-level сигнал отдельно, запустить `train --agg-dropout 1.0` (всё равно AUC=1.0).
+1. **pandas 3.0 datetime resolution = microseconds** по умолчанию. В
+   `aggregate.py:_prepare_batch` конвертация в секунды через
+   `dt.astype("datetime64[s]").view("int64")` — устойчиво к обеим резолюциям.
+2. **`Series.view` удалён в pandas 3.0** — использовать `to_numpy().view(...)`
+   или `astype(...)`.
+3. **`session_id` в pretrain 100% NULL** — fallback к `event_id`
+   обязателен, иначе все session-keyed фичи коллапсируют.
+4. **Тип чекпоинта при загрузке:** `torch.load(..., weights_only=False)`
+   нужен, потому что в чекпоинте лежит pickled-препроцессор.
+5. **AUC=1.0 не баг.** Это следствие того, что синтетические фичи генерируются
+   conditional на target. Чтобы проверить event-level сигнал отдельно,
+   запустить `train --agg-dropout 1.0` (всё равно AUC=1.0).
+6. **Augmented parquet ≠ source parquet.** Augmented содержит **только** 71
+   колонку task.md. Старые source-поля (`event_type_nm`, `event_desc`,
+   `channel_indicator_type` и т.п.) в нём отсутствуют. Если нужны — читать
+   из `data/`.
 
 ## Дальнейшие улучшения (не реализованы)
 
-- **Без утечки агрегатов:** считать аггрегаты по клиенту, исключая размеченные события (или используя time-based split).
-- **Сабмишен через CLI:** добавить `python -m trainer.cli predict` вместо отдельного скрипта.
+- **Без утечки агрегатов:** считать аггрегаты по клиенту, исключая
+  размеченные события (или используя time-based split).
+- **Сабмишен через CLI:** добавить `python -m trainer.cli predict` вместо
+  отдельного скрипта.
 - **Sequence-модель:** GRU/Transformer по истории клиента вместо плоского MLP.
 - **Time-based валидация:** холдаут по дате, а не stratified random.
 - **Semi-supervised pretrain:** masked-feature reconstruction на pretrain без меток.
+- **Real fingerprinting integration:** заменить синтетические canvas/audio/webgl
+  отпечатки данными из реального fingerprinting SDK.
 
 ## Полезные команды
 
@@ -203,6 +327,9 @@ python3 -m trainer.cli all
 
 # Только инференс на test
 python3 predict_example.py
+
+# JSON-инференс с замером времени
+python3 predict_from_json.py test1.json
 
 # Проверка чекпоинта
 python3 -c "import torch; ck = torch.load('trainer/checkpoints/best.pt', weights_only=False); print('AUC:', ck['val_auc'], 'epoch:', ck['epoch'])"
