@@ -150,16 +150,38 @@ _SUM_COLS_FROM_BATCH = (
 _STATE_EXTRA_COLS = ("__max_amt", "__min_ts", "__max_ts")
 
 
+def _processed_files_path(state_path: Path) -> Path:
+    """Companion parquet next to state — records which input files were already
+    folded into the raw sums. Same dir, same stem, `.files.parquet` suffix.
+    """
+    return state_path.with_name(state_path.stem + ".files.parquet")
+
+
 class CustomerAggregator:
     def __init__(self) -> None:
         self._sums: pd.DataFrame | None = None
         self._max_amt: pd.Series | None = None
         self._min_ts: pd.Series | None = None
         self._max_ts: pd.Series | None = None
+        # File-level idempotency: (path, size, mtime_ns) of every parquet
+        # whose contents are already in the raw sums.
+        self._processed_files: set[tuple[str, int, int]] = set()
 
     # ------------------------------------------------------------------
     # Persistence — for incremental daily runs.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _file_key(path: Path) -> tuple[str, int, int]:
+        st = path.stat()
+        return (str(path), int(st.st_size), int(st.st_mtime_ns))
+
+    def should_process(self, path: Path) -> bool:
+        """True if `path` is not yet in the processed-files set."""
+        return self._file_key(path) not in self._processed_files
+
+    def mark_processed(self, path: Path) -> None:
+        self._processed_files.add(self._file_key(path))
 
     def save_state(self, path: Path) -> None:
         if self._sums is None:
@@ -171,6 +193,13 @@ class CustomerAggregator:
         path.parent.mkdir(parents=True, exist_ok=True)
         state.reset_index().to_parquet(str(path), compression="snappy", index=False)
 
+        # Persist the processed-files set alongside the state.
+        files_df = pd.DataFrame(
+            list(self._processed_files), columns=["path", "size", "mtime_ns"]
+        )
+        files_df.to_parquet(str(_processed_files_path(path)),
+                            compression="snappy", index=False)
+
     @classmethod
     def load_state(cls, path: Path) -> "CustomerAggregator":
         agg = cls()
@@ -181,6 +210,14 @@ class CustomerAggregator:
         agg._min_ts = df["__min_ts"]
         agg._max_ts = df["__max_ts"]
         agg._sums = df.drop(columns=list(_STATE_EXTRA_COLS))
+
+        files_path = _processed_files_path(path)
+        if files_path.exists():
+            files_df = pq.read_table(str(files_path)).to_pandas()
+            agg._processed_files = {
+                (str(r.path), int(r.size), int(r.mtime_ns))
+                for r in files_df.itertuples(index=False)
+            }
         return agg
 
     def process(self, df: pd.DataFrame) -> None:
@@ -369,28 +406,56 @@ def build_customer_features(
         agg = CustomerAggregator.load_state(state_path)
         if progress and agg._sums is not None:
             print(f"[aggregate] resumed state from {state_path} "
-                  f"({len(agg._sums):,} customers)")
+                  f"({len(agg._sums):,} customers, "
+                  f"{len(agg._processed_files):,} files already folded in)")
     else:
         agg = CustomerAggregator()
 
+    # In incremental mode, skip files whose (path, size, mtime_ns) already
+    # appears in the persisted set. In full mode, process everything.
+    if incremental:
+        new_paths = [p for p in paths if agg.should_process(p)]
+        skipped = len(paths) - len(new_paths)
+        if progress and skipped:
+            print(f"[aggregate] skipping {skipped} file(s) already in state")
+        paths = new_paths
+
     if not paths:
         if progress:
-            print("[aggregate] no input parquets — nothing to process")
-    cur_file = None
+            print("[aggregate] no new input parquets — nothing to process")
+    cur_file: str | None = None
+    cur_path: Path | None = None
+    file_by_name = {p.name: p for p in paths}
     for fname, df, total, written in _iter_batches(paths, batch_rows):
-        if progress and fname != cur_file:
+        if fname != cur_file:
             cur_file = fname
-            print(f"[aggregate] {fname}: {total:,} rows")
+            cur_path = file_by_name.get(fname)
+            if progress:
+                print(f"[aggregate] {fname}: {total:,} rows")
         agg.process(df)
         if progress:
             print(f"  ... {written:,}/{total:,}", end="\r")
+        # When we've consumed the last batch of this file, mark it processed.
+        if cur_path is not None and written >= total:
+            agg.mark_processed(cur_path)
+            cur_path = None  # avoid double-marking on next batch boundary
     if progress and cur_file is not None:
         print()
 
     if incremental and state_path is not None and agg._sums is not None:
         agg.save_state(state_path)
         if progress:
-            print(f"[aggregate] saved state -> {state_path}")
+            print(f"[aggregate] saved state -> {state_path} "
+                  f"({len(agg._processed_files):,} processed files tracked)")
+
+    # If no new files and no prior state, return empty — don't crash on finalize.
+    if agg._sums is None:
+        if progress:
+            print("[aggregate] no data — writing empty customer_features.parquet")
+        empty = pd.DataFrame(columns=["customer_id"] + FEATURE_COLUMNS)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        empty.to_parquet(str(output_path), compression="snappy", index=False)
+        return empty
 
     feats = agg.finalize()
     output_path.parent.mkdir(parents=True, exist_ok=True)

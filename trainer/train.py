@@ -45,6 +45,12 @@ class TrainConfig:
     registered_model_name: str | None = None  # e.g. "fraud_mlp_web"
     data_hash: str | None = None  # tag, прокидывается из daily_flow / DVC
 
+    # Warm-start (opt-in): загрузить веса из чекпоинта перед обучением.
+    # Поддерживается путь к local `best.pt` или MLFlow URI вида
+    # `models:/fraud_mlp_web/Production`. Несовпадение vocab/embedding sizes
+    # переживается через `strict=False` + лог несоответствий.
+    warm_start_from: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Metric helpers
@@ -130,6 +136,29 @@ def _git_sha() -> str | None:
         return out.decode().strip()
     except Exception:
         return None
+
+
+def _load_warm_start_state(source: str) -> dict:
+    """Load `model_state` dict from a local `best.pt` or an MLFlow URI.
+
+    Local: any path that doesn't start with `models:/` or `runs:/`.
+    MLFlow: `models:/<name>/<stage|version>` or `runs:/<run_id>/<artifact>`.
+    """
+    if source.startswith("models:/") or source.startswith("runs:/"):
+        try:
+            import mlflow  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                f"warm_start_from={source!r} requires mlflow. pip install mlflow."
+            ) from e
+        # Download the pyfunc model's checkpoint artifact and read state_dict.
+        local_path = mlflow.artifacts.download_artifacts(source)
+        ck_path = Path(local_path) / "artifacts" / "checkpoint"
+        ck = torch.load(ck_path, map_location="cpu", weights_only=False)
+        return ck["model_state"]
+
+    ck = torch.load(source, map_location="cpu", weights_only=False)
+    return ck["model_state"]
 
 
 class _Tracker:
@@ -304,6 +333,17 @@ def _train_impl(
         n_numeric=preproc.n_numeric,
         n_aggregate=preproc.n_aggregate,
     ).to(config.device)
+
+    if config.warm_start_from:
+        state = _load_warm_start_state(config.warm_start_from)
+        result = model.load_state_dict(state, strict=False)
+        if progress:
+            print(f"[train] warm-started from {config.warm_start_from}")
+            if result.missing_keys:
+                print(f"[train]   missing keys: {result.missing_keys}")
+            if result.unexpected_keys:
+                print(f"[train]   unexpected keys: {result.unexpected_keys}")
+        tracker.set_tag("warm_started_from", config.warm_start_from)
 
     n_pos = float((y_tr == 1).sum())
     n_neg = float((y_tr == 0).sum())

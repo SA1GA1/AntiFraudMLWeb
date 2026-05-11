@@ -16,7 +16,8 @@ class FlowConfig:
     events_glob: str
     labels_glob: str
     state_path: Path
-    output_dir: Path
+    work_dir: Path          # where aggregate/extract write parquet outputs
+    output_dir: Path        # where train writes best.pt + metrics.json
     mlflow_uri: str
     mlflow_experiment: str
     model_name: str
@@ -40,6 +41,9 @@ class FlowConfig:
             state_path=Path(os.environ.get(
                 "FRAUD_STATE_PATH",
                 str(root / "state" / "customer_features.state.parquet"),
+            )),
+            work_dir=Path(os.environ.get(
+                "FRAUD_WORK_DIR", str(root / "work"),
             )),
             output_dir=Path(os.environ.get(
                 "FRAUD_OUTPUT_DIR", "trainer/checkpoints"

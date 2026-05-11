@@ -9,12 +9,13 @@
 # Input data
 events_glob: /home/clever/fraud/events/dt=*/*.parquet
 labels_glob: /home/clever/fraud/labels/dt=*/*.parquet
-label_window_end: "2026-05-04"   # today() - 7 days; daily_flow overrides at runtime
+label_window_end: "2026-05-05"   # today() - 7 days; daily_flow overrides at runtime
 
-# Local working directories
-data_dir: data_augmented
+# Working directories
+data_dir: data_augmented                              # legacy source root
+work_dir: /home/clever/fraud/work                     # aggregate/extract outputs
 state_path: /home/clever/fraud/state/customer_features.state.parquet
-output_dir: trainer/checkpoints
+output_dir: trainer/checkpoints                       # best.pt + metrics.json
 
 # Training
 epochs: 20

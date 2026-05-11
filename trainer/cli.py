@@ -31,9 +31,20 @@ def _add_io(p: argparse.ArgumentParser) -> None:
                    help="Directory with parquet event files (legacy mode).")
     p.add_argument("--labels", type=Path, default=Path("data/train_labels.parquet"),
                    help="Path to single labels parquet (legacy mode).")
+    p.add_argument("--work-dir", type=Path, default=None,
+                   help=("Directory where aggregate/extract write their outputs "
+                         "(customer_features.parquet, labelled_events.parquet) "
+                         "and where train reads them. Defaults to --input for "
+                         "backward compatibility with legacy commands. In daily "
+                         "flow this should be set to ~/fraud/work to avoid "
+                         "overwriting the baseline in data_augmented/."))
     p.add_argument("--out", type=Path, default=Path("trainer/checkpoints"),
                    help="Output directory for model checkpoints + metrics.")
     p.add_argument("--quiet", action="store_true")
+
+
+def _resolve_work_dir(args: argparse.Namespace) -> Path:
+    return args.work_dir if args.work_dir is not None else args.input
 
 
 def _add_events_glob(p: argparse.ArgumentParser) -> None:
@@ -91,6 +102,15 @@ def _add_train_hparams(p: argparse.ArgumentParser) -> None:
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--device", type=str, default=None,
                    help="cuda / cpu (default: auto).")
+    p.add_argument(
+        "--warm-start-from",
+        type=str,
+        default=None,
+        help=("Path to local best.pt or MLFlow URI "
+              "(models:/fraud_mlp_web/Production) to load model_state from "
+              "before training. Strict=False on load_state_dict — vocab "
+              "size changes survive. Opt-in, off by default."),
+    )
 
 
 def _add_mlflow(p: argparse.ArgumentParser) -> None:
@@ -134,6 +154,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     e = sub.add_parser("extract", help="Build labelled_events.parquet")
     _add_io(e); _add_events_glob(e); _add_labels_glob(e)
     e.add_argument("--batch-rows", type=int, default=200_000)
+    e.add_argument(
+        "--append",
+        action="store_true",
+        help=("Union new matches with the existing labelled_events.parquet "
+              "(deduplicated by customer_id+event_id). Daily flow uses this "
+              "to accumulate labels across runs."),
+    )
 
     t = sub.add_parser("train", help="Train FraudMLP")
     _add_io(t); _add_train_hparams(t); _add_mlflow(t)
@@ -151,8 +178,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def _do_aggregate(args, progress: bool) -> None:
-    output = (args.input / "customer_features.parquet"
-              if args.input else Path("customer_features.parquet"))
+    work_dir = _resolve_work_dir(args)
+    output = work_dir / "customer_features.parquet"
     build_customer_features(
         input_dir=args.input,
         output_path=output,
@@ -165,8 +192,8 @@ def _do_aggregate(args, progress: bool) -> None:
 
 
 def _do_extract(args, progress: bool) -> None:
-    output = (args.input / "labelled_events.parquet"
-              if args.input else Path("labelled_events.parquet"))
+    work_dir = _resolve_work_dir(args)
+    output = work_dir / "labelled_events.parquet"
     extract_labelled_events(
         input_dir=args.input,
         labels_path=args.labels,
@@ -174,12 +201,14 @@ def _do_extract(args, progress: bool) -> None:
         events_glob=args.events_glob,
         labels_glob=args.labels_glob,
         label_window_end=getattr(args, "label_window_end", None),
+        append=getattr(args, "append", False),
         batch_rows=args.batch_rows,
         progress=progress,
     )
 
 
 def _do_train(args, progress: bool) -> None:
+    work_dir = _resolve_work_dir(args)
     cfg = TrainConfig(
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -195,10 +224,11 @@ def _do_train(args, progress: bool) -> None:
         mlflow_run_name=getattr(args, "mlflow_run_name", None),
         registered_model_name=getattr(args, "registered_model_name", None),
         data_hash=getattr(args, "data_hash", None),
+        warm_start_from=getattr(args, "warm_start_from", None),
     )
     train(
-        labelled_path=args.input / "labelled_events.parquet",
-        aggregates_path=args.input / "customer_features.parquet",
+        labelled_path=work_dir / "labelled_events.parquet",
+        aggregates_path=work_dir / "customer_features.parquet",
         output_dir=args.out,
         config=cfg,
         progress=progress,

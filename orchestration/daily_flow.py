@@ -48,13 +48,14 @@ def compute_data_hash(events_glob: str) -> str:
 
 
 @task(retries=3, retry_delay_seconds=[60, 300, 900])
-def run_aggregate(events_glob: str, state_path: str) -> None:
+def run_aggregate(events_glob: str, state_path: str, work_dir: str) -> None:
     subprocess.run(
         [
             "python", "-m", "trainer.cli", "aggregate",
             "--events-glob", events_glob,
             "--incremental",
             "--state-path", state_path,
+            "--work-dir", work_dir,
         ],
         check=True,
     )
@@ -62,7 +63,7 @@ def run_aggregate(events_glob: str, state_path: str) -> None:
 
 @task(retries=2, retry_delay_seconds=[60, 300])
 def run_extract(
-    events_glob: str, labels_glob: str, label_window_end: str
+    events_glob: str, labels_glob: str, label_window_end: str, work_dir: str
 ) -> None:
     subprocess.run(
         [
@@ -70,6 +71,8 @@ def run_extract(
             "--events-glob", events_glob,
             "--labels-glob", labels_glob,
             "--label-window-end", label_window_end,
+            "--work-dir", work_dir,
+            "--append",
         ],
         check=True,
     )
@@ -83,7 +86,22 @@ def run_train(
     data_hash: str,
     epochs: int,
     output_dir: str,
-) -> None:
+    work_dir: str,
+) -> int:
+    """Returns: number of labelled events used for training.
+
+    If labelled_events.parquet is empty, skips training and returns 0.
+    """
+    import pyarrow.parquet as pq
+    from pathlib import Path
+
+    labelled_path = Path(work_dir) / "labelled_events.parquet"
+    if not labelled_path.exists():
+        return 0
+    n_rows = pq.ParquetFile(str(labelled_path)).metadata.num_rows
+    if n_rows == 0:
+        return 0
+
     subprocess.run(
         [
             "python", "-m", "trainer.cli", "train",
@@ -93,9 +111,11 @@ def run_train(
             "--data-hash", data_hash,
             "--epochs", str(epochs),
             "--out", output_dir,
+            "--work-dir", work_dir,
         ],
         check=True,
     )
+    return n_rows
 
 
 @task
@@ -127,20 +147,34 @@ def daily_flow(
     logger.info("flow start  events=%s  labels=%s  window_end=%s",
                 cfg.events_glob, cfg.labels_glob, label_window_end)
 
+    # Ensure work_dir exists so subprocess writes don't error on missing dir.
+    cfg.work_dir.mkdir(parents=True, exist_ok=True)
+
     data_hash = compute_data_hash(cfg.events_glob)
     logger.info("data_hash=%s", data_hash)
 
-    agg = run_aggregate.submit(cfg.events_glob, str(cfg.state_path))
+    agg = run_aggregate.submit(
+        cfg.events_glob, str(cfg.state_path), str(cfg.work_dir)
+    )
     ext = run_extract.submit(
-        cfg.events_glob, cfg.labels_glob, label_window_end, wait_for=[agg]
+        cfg.events_glob, cfg.labels_glob, label_window_end,
+        str(cfg.work_dir), wait_for=[agg],
     )
-    tr = run_train.submit(
+    n_labelled = run_train.submit(
         cfg.mlflow_uri, cfg.mlflow_experiment, cfg.model_name,
-        data_hash, epochs, str(cfg.output_dir),
+        data_hash, epochs, str(cfg.output_dir), str(cfg.work_dir),
         wait_for=[ext],
-    )
+    ).result()
+
+    if n_labelled == 0:
+        logger.warning(
+            "labelled_events is empty — no new labels in window. "
+            "Skipping train + promote + notify."
+        )
+        return {"promoted": False, "decision": {"reason": "no_new_labels"}}
+
     decision = run_promote.submit(
-        cfg.model_name, cfg.mlflow_uri, cfg.auc_tolerance, wait_for=[tr]
+        cfg.model_name, cfg.mlflow_uri, cfg.auc_tolerance,
     ).result()
     logger.info("promote decision: %s", decision)
 

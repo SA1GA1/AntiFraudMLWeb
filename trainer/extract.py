@@ -88,9 +88,18 @@ def extract_labelled_events(
     events_glob: str | Iterable[str] | None = None,
     labels_glob: str | Iterable[str] | None = None,
     label_window_end: pd.Timestamp | str | None = None,
+    append: bool = False,
     batch_rows: int = 200_000,
     progress: bool = True,
 ) -> pd.DataFrame:
+    """Extract labelled events from event partitions × labels.
+
+    Behavior on 0 matches: returns empty DataFrame (does NOT raise). If
+    `append=True` and `output_path` already exists, the new matches are
+    unioned with the existing labelled set and deduplicated by
+    `(customer_id, event_id)`. This makes daily reruns idempotent — no new
+    labels today simply leaves the accumulated set intact.
+    """
     event_paths = _resolve_event_paths(input_dir, events_glob, train_files)
     for p in event_paths:
         if not p.exists():
@@ -122,13 +131,42 @@ def extract_labelled_events(
         if progress:
             print()
 
-    if not chunks:
-        raise RuntimeError("No labelled events found in the configured event paths.")
+    new_labelled = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
 
-    labelled = pd.concat(chunks, ignore_index=True)
+    if append and output_path.exists():
+        existing = pq.read_table(str(output_path)).to_pandas()
+        if progress:
+            print(f"[extract] appending to existing {len(existing):,} rows")
+        if len(new_labelled):
+            combined = pd.concat([existing, new_labelled], ignore_index=True)
+            combined = combined.drop_duplicates(
+                subset=["customer_id", "event_id"], keep="last"
+            ).reset_index(drop=True)
+        else:
+            combined = existing
+        labelled = combined
+    else:
+        labelled = new_labelled
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    labelled.to_parquet(str(output_path), compression="snappy", index=False)
+    if len(labelled):
+        labelled.to_parquet(str(output_path), compression="snappy", index=False)
+    else:
+        # Write an empty parquet so downstream stages see the file.
+        # Schema is whatever the first event parquet defines + a target column.
+        empty_schema = pq.ParquetFile(str(event_paths[0])).schema_arrow
+        import pyarrow as pa
+        target_field = pa.field("target", pa.int64())
+        empty_with_target = pa.schema(list(empty_schema) + [target_field])
+        pa.parquet.write_table(empty_with_target.empty_table(), str(output_path))
+
     if progress:
-        print(f"[extract] wrote {len(labelled):,} labelled rows -> {output_path}")
-        print(f"[extract] target dist: {labelled['target'].value_counts().to_dict()}")
+        if len(labelled):
+            print(f"[extract] wrote {len(labelled):,} labelled rows -> {output_path}")
+            if "target" in labelled.columns:
+                print(f"[extract] target dist: {labelled['target'].value_counts().to_dict()}")
+        else:
+            print(f"[extract] WARNING: no labelled events found "
+                  f"(events={len(event_paths)} files, labels={len(labels):,}). "
+                  f"Wrote empty {output_path}.")
     return labelled

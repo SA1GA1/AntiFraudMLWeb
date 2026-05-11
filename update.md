@@ -339,3 +339,51 @@ mlflow.set_tag("train_date", "2026-05-11")
 
 После этого ежедневная таска физически никогда не пересекается с
 прод-сервисом — только через реестр.
+
+---
+
+## 4. Статус реализации (на 2026-05-12)
+
+Документ выше — это **проектное обсуждение** перед началом работы. Ниже
+зафиксировано что из него действительно реализовано в репо.
+
+### Сделано
+
+| Раздел в этом документе | Где в коде | Статус |
+|---|---|---|
+| 1.1 MLFlow tracking | `trainer/train.py:_Tracker` | ✅ опционально через `--mlflow-uri` |
+| 1.2 PyFunc + Model Registry | `trainer/pyfunc.py` + `train.py:_Tracker.log_pyfunc` | ✅ |
+| 2.1 Prefect daily flow | `orchestration/daily_flow.py` | ✅ |
+| 2.1 Cron schedule | `orchestration/deployment.py` (CronSchedule env-driven) | ✅ |
+| 2.2 DVC | `.dvc/config`, `dvc.yaml`, `params.yaml` | ✅ установлено + `dvc add data/` + 8× source parquet'ов |
+| 2.3 Validation gate | `orchestration/promote.py:validate_and_promote` | ✅ AUC tolerance 0.005 |
+| 2.5.2 Инкрементальные агрегаты | `trainer/aggregate.py:CustomerAggregator.save_state/load_state` | ✅ |
+| 3.2 Hot-reload контракт | `orchestration/notify.py:notify_backend` | ✅ клиентская часть готова, ждёт endpoint в `AntiFraudMain` |
+| 3.5 Inference через MLFlow | `trainer/pyfunc.py:FraudPyfunc` (bundled с `code_paths=["trainer"]`) | ✅ |
+
+### Не сделано (в скоупе follow-up)
+
+| Раздел | Почему отложено |
+|---|---|
+| 2.4 Pandera / Evidently | Schema gap — отдельный тикет, см. `AntiFraudMain/update.md` |
+| 2.5.3 Late-label window | Реализовано в `extract`, но требует `label_dttm` в meta — у текущих меток его нет |
+| 2.7 Feast / Spark / k8s | Преждевременно — single-host setup пока тянет |
+| 3 Backend split | Server-side: event-sink, `/admin/reload-model` — тикеты в `AntiFraudMain` |
+
+### Известные баги текущей реализации
+
+См. `CLAUDE.md` раздел «Известные баги daily_flow»:
+1. Overwrites baseline в `data_augmented/` (нет `--input` в subprocess calls).
+2. Падает на test.parquet-only events_glob (нет меток).
+3. Training с нуля, не fine-tuning (по дизайну, но стоит задокументировать
+   warm-start как option).
+
+### Параллельные документы
+
+- `README.md` — корневой обзор + Quick start.
+- `CLAUDE.md` — карта проекта для контекстных ассистентов, gotchas, команды.
+- `DATA.md` — детальная схема данных + production-партиции.
+- `trainer/README.md` — все CLI флаги, MLFlow интеграция.
+- `AntiFraudMain/update.md` — schema gap между backend и trainer.
+- `/home/clever/.claude/plans/replicated-sauteeing-tower.md` — план реализации
+  (зафиксирован после обсуждения, обновлён по ходу).

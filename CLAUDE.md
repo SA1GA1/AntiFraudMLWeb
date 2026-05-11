@@ -342,6 +342,27 @@ prefect worker start --pool default &
 python3 -m orchestration.daily_flow
 ```
 
+### ⚠ Известные баги daily_flow
+
+1. **Overwrites baseline в `data_augmented/`.** `daily_flow.run_aggregate` /
+   `run_extract` вызывают `trainer.cli` без `--input`, поэтому используется
+   дефолт `data_augmented`, и `customer_features.parquet` /
+   `labelled_events.parquet` пишутся туда, перезаписывая исходный baseline
+   (100 K customers, 87 K labelled events). До исправления — делать
+   backup или менять дефолт в `_do_aggregate`/`_do_extract`.
+
+2. **Падает на пустом `~/fraud/events/`.** `compute_data_hash` отрабатывает
+   на пустом globe, но `run_extract` падает с "No labelled events found"
+   если в events лежит только test.parquet (у него по определению нет
+   меток). Решение для bootstrap'а — скопировать в events `train_part_*`
+   с реальными метками.
+
+3. **Тренировка с нуля, не fine-tuning.** `_train_impl` создаёт свежий
+   `FraudMLP(...)` без `model.load_state_dict(previous_best.pt)`. Если
+   нужен warm-start между runs — реализовать отдельно. Это означает,
+   что `data_augmented/*.parquet` НЕ переиспользуется автоматически —
+   trainer видит только то, что лежит в текущих outputs aggregate/extract.
+
 ## Окружение
 
 - Python 3.14, pandas 2.3.3 (downgraded mlflow constraint), pyarrow 23.0.1,

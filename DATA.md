@@ -150,15 +150,64 @@ event_id,predict
 ...
 ```
 
-## Pipeline для воспроизведения
+## Pipeline для воспроизведения (legacy / baseline)
 
 ```bash
 # 1. Сгенерировать augmented-схему task.md (71 колонка) в data_augmented/
 python3 -m feature_generator.cli
 
-# 2. Построить агрегаты и labelled-набор + обучить модель
-python3 -m trainer.cli all
+# 2. Построить агрегаты + labelled-набор + обучить модель
+python3 -m trainer.cli all --input data_augmented \
+  --mlflow-uri file:///home/clever/fraud/mlruns \
+  --registered-model-name fraud_mlp_web
 
-# 3. Инференс на test.parquet → submission.csv
+# 3. (dev) Локальный inference из best.pt
 python3 predict_example.py
 ```
+
+Производственный inference уехал в `AntiFraudMain`, который загружает
+модель из MLFlow Registry (`models:/fraud_mlp_web/Production`). См.
+`README.md` и `update.md`.
+
+---
+
+# Production-схема: партиционированные parquet'ы от backend
+
+После реализации event-sink в `AntiFraudMain` события и метки будут
+приходить в **партиционированной** структуре, читаемой `daily_flow`:
+
+```
+~/fraud/                     # (на проде /var/fraud/)
+├── events/
+│   ├── dt=2026-05-11/
+│   │   ├── part-<uuid1>.parquet
+│   │   └── part-<uuid2>.parquet
+│   ├── dt=2026-05-12/
+│   │   └── part-<uuid3>.parquet
+│   └── ...
+└── labels/
+    ├── dt=2026-05-11/
+    │   └── part-<uuid>.parquet  # late-arriving chargeback labels
+    └── ...
+```
+
+**Схема файлов в `events/`** — те же 71 колонка task.md, что в
+`data_augmented/`. Backend дополнительно отвечает за enrichment:
+парсинг User-Agent (`browser_name`, `os_type`), GeoIP (`asn`, `isp_name`),
+session-state (`login_method`, `failed_login_attempts`). Биометрика
+(mouse/keyboard/canvas) приходит из frontend SDK.
+
+**Схема файлов в `labels/`** — три колонки `(customer_id, event_id, target)`
++ опционально `label_dttm` (timestamp когда метка была получена).
+Если `label_dttm` есть, `trainer.cli extract --label-window-end DATE`
+оставляет только метки в окне `[DATE-30d, DATE-7d]` (учёт chargeback-лага).
+
+**Перетекание из bootstrap в production:**
+
+| Фаза | events_glob | labels_glob |
+|------|-------------|-------------|
+| Bootstrap (сейчас) | `data_augmented/*.parquet` | `data/train_labels.parquet` |
+| Hybrid | оба источника одновременно | оба |
+| Mature (>30 дней реальных) | `~/fraud/events/dt=*/*.parquet` | `~/fraud/labels/dt=*/*.parquet` |
+
+Подробнее в `update.md` и плане в `/home/clever/.claude/plans/replicated-sauteeing-tower.md`.

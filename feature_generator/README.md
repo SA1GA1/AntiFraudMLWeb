@@ -1,9 +1,21 @@
 # feature_generator
 
+> **Статус: dev/CI only.** В production daily flow (`orchestration/daily_flow.py`)
+> не используется. Реальные события приходят от `AntiFraudMain` в
+> `~/fraud/events/dt=*/` уже в task.md-схеме. `feature_generator` остаётся
+> для трёх задач:
+> 1. Воспроизведение исходного синтетического baseline'а.
+> 2. Smoke-тесты trainer'а / препроцессора в CI.
+> 3. Seed-датасет для разработчиков без доступа к реальным данным.
+
 Augments the source banking dataset with the **71-column web-fraud schema**
 defined in `task.md` (browser identity, mouse/keyboard biometrics, network,
 device fingerprints, login/trust). The augmented parquet replaces the source
 columns — output contains exactly the 71 columns from `task.md`.
+
+> ⚠ Признаки синтезируются **conditional на target** (где он известен) и на
+> source-флаги риска. Это даёт AUC=1.0 на размеченной выборке — **не баг, а
+> цель** для baseline'а. На реальных данных от backend'а AUC будет ниже.
 
 ## Usage
 
