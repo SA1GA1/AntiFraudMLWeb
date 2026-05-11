@@ -19,7 +19,7 @@ data_augmented/*.parquet ──┬─► customer_features.parquet  (aggregate s
 ## Usage
 
 ```bash
-cd /home/clever/Documents/ITParkHackathon
+cd /home/clever/Documents/AntiFraud/AntiFraudMLWeb
 
 # One-shot:
 python3 -m trainer.cli all
@@ -37,7 +37,7 @@ Flags for `train`: `--epochs 20`, `--batch-size 4096`, `--lr 1e-3`,
 
 | Module | Purpose |
 |---|---|
-| `aggregate.py` | Streams pretrain+train+pretest, computes 23 per-customer features |
+| `aggregate.py` | Streams pretrain+train+pretest, computes 49 per-customer features |
 | `extract.py`   | Inner-joins train_part_* with train_labels → labelled_events.parquet |
 | `preprocess.py`| Picklable `Preprocessor` (vocab + z-score) — no sklearn dep |
 | `dataset.py`   | `FraudDataset` with per-sample aggregate dropout |

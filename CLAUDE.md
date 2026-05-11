@@ -53,7 +53,7 @@ AntiFraudMLWeb/
 ├── data/                          # Исходные parquet'ы (не трогаем)
 ├── data_augmented/                # 8 augmented файлов (71 task.md колонка)
 │   ├── *.parquet
-│   ├── customer_features.parquet  # 100 K клиентов × 47 агрегатов
+│   ├── customer_features.parquet  # 100 K клиентов × 49 агрегатов
 │   └── labelled_events.parquet    # 87 514 размеченных событий с фичами
 ├── feature_generator/             # Этап 1: 71-колоночная task.md схема
 ├── trainer/                       # Этап 2: обучение MLP
@@ -159,13 +159,13 @@ python3 -m feature_generator.cli --files test.parquet
 ## Этап 2 — trainer
 
 Обучает бинарный классификатор (PyTorch MLP) на 87 514 размеченных событиях
-с обогащением 47 агрегатами по истории клиента.
+с обогащением 49 агрегатами по истории клиента.
 
 ### Пайплайн
 
 ```
 data_augmented/*.parquet
-   ├── aggregate ───► customer_features.parquet (100 K × 47 фичей)
+   ├── aggregate ───► customer_features.parquet (100 K × 49 фичей)
    └── extract  ───► labelled_events.parquet  (87 K × 71 + target)
                           │
                           ▼
@@ -183,7 +183,7 @@ data_augmented/*.parquet
 
 - 19 категориальных колонок → эмбеддинги `min(32, ⌈√vocab⌉)`. Cardinality cap = 1024 с бакетом OTHER.
 - 44 числовые → z-score (mean/std из train-сплита, NaN → 0).
-- 47 агрегатов → z-score.
+- 49 агрегатов → z-score.
 - `has_history` (0/1) — флаг наличия агрегатов для клиента.
 - Конкатенация → Linear(IN, 256) + BN + ReLU + Dropout(0.3) → Linear(256, 128) + BN + ReLU + Dropout(0.3) → Linear(128, 64) + ReLU → Linear(64, 1).
 - Loss: `BCEWithLogitsLoss(pos_weight = n_neg / n_pos)`.
@@ -211,7 +211,7 @@ mouse/click/scroll/keyboard/form-метрики, session-shape, login-trust,
 `customer_features.parquet`). При инференсе клиенты без агрегатов получают
 нули + `has_history=0`.
 
-### 47 агрегатов по клиенту
+### 49 агрегатов по клиенту
 
 `event_count`, `amt_mean/std/max/log_mean`, `dev_tools_share`, `headless_share`,
 `incognito_share`, `vpn_share`, `proxy_share`, `tor_share`,

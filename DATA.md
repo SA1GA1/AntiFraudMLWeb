@@ -84,50 +84,59 @@
 
 # Расширенный набор: `data_augmented/`
 
-После прогона `python3 -m feature_generator.cli` рядом с `data/` появляется директория `data_augmented/` с теми же 8 файлами событий, но с **36 колонками** (23 исходных + 13 синтетических). Файлы `train_labels.parquet` и `sample_submit.csv` не дублируются.
+После прогона `python3 -m feature_generator.cli` рядом с `data/` появляется директория `data_augmented/` с теми же 8 файлами событий, но в **71-колоночной схеме `task.md`** (browser identity, mouse/keyboard биометрия, network, fingerprints, login/trust). Исходные 23 колонки в augmented-файлы не сохраняются — это полная замена. Файлы `train_labels.parquet` и `sample_submit.csv` не дублируются.
 
-## 13 синтетических признаков
+## 71 синтетический признак
 
-Все генерируются детерминированно (SplitMix64-хеш от int-ключа + salt + global seed). При наличии метки `target` распределения параметризованы class-conditional bias (risk=0.85 для фрода, 0.10 для нормы), иначе вычисляются из существующих риск-флагов (`compromised`, `developer_tools`, `web_rdp_connection`, `phone_voip_call_state`).
+Все генерируются детерминированно (SplitMix64-хеш от int-ключа + salt + global seed). При наличии метки `target` распределения параметризованы class-conditional bias (risk=0.85 для фрода, 0.10 для нормы), иначе вычисляются из существующих риск-флагов (`compromised`, `developer_tools`, `web_rdp_connection`, `phone_voip_call_state`). Полный перечень — в `task.md` и `feature_generator/README.md`.
 
-| Колонка | Тип | Ключ стабильности | Назначение |
-|---|---|---|---|
-| `attestation_status` | str (4 кат.) | customer_id | Результат аппаратной аттестации ОС: `passed`, `failed_root`, `emulator`, `modified_firmware`. Детектирует рут, эмуляторы, модифицированные прошивки. |
-| `app_background_events` | int32 ≥0 | session_id | Сворачивания приложения во время заполнения формы — параллельная работа с инструкциями мошенника или фоновые скрипты. |
-| `clipboard_paste_ratio_mobile` | float32 [0,1] | session_id | Доля вставок из буфера обмена при вводе — копирование реквизитов из фишинга или автозаполнение. |
-| `entry_source` | str (4 кат.) | event_id | Способ запуска сессии: `manual`, `push`, `deeplink`, `sms_link`. Отсекает ботов и переходы по фрод-URL. |
-| `connection_type` | str (5 кат.) | session_id | Тип подключения: `wifi_home`, `cellular`, `wifi_public`, `vpn`, `tor`. Аномалии: публичный Wi-Fi, VPN, частая смена SIM. |
-| `touch_typing_rhythm` | float32 | session_id | Коэффициент вариации интервалов нажатий: человек ~0.3-0.6, бот <0.1. |
-| `sim_country_mismatch` | int8 (0/1) | customer_id | Флаг расхождения страны SIM, IP и часового пояса — прокси-сети, фермы дропперов. |
-| `network_rtt_avg` | float32 (ms) | session_id | Среднее время сетевого отклика до сервера банка — удалённое управление, медленные туннели. |
-| `biometric_entry_used` | int8 (0/1) | customer_id + event_id | Успешный вход через FaceID/TouchID вместо пароля — подтверждает физическое присутствие владельца. |
-| `storage_free_percent` | float32 [0,100] | customer_id + event_id | Уровень свободной памяти — старые/перегруженные устройства часто принадлежат дропперам и ботам. |
-| `battery_charging_state` | str (4 кат.) | event_id | Статус зарядки: `discharging`, `charging`, `full`, `plugged_24_7`. Последнее — автоматизированные фрод-устройства. |
-| `screen_orientation_changes` | int32 ≥0 | session_id | Частота смены ориентации экрана — аномально высокая при RDP/VNC. |
-| `debugger_attached` | int8 (0/1) | event_id | Подключение системного отладчика или инъекции (Frida/Xposed) — обход защит, взлом, анализ трафика. |
+Сводка по группам:
+
+| Группа | Кол-во | Примеры |
+|---|---:|---|
+| Identity / passthrough | 10 | `customer_id`, `event_id`, `session_id`, `event_dttm`, `operaton_amt`, `currency_iso_cd`, `mcc_code`, `pos_cd`, `browser_language`, `accept_language` |
+| Browser identity (per-customer стабильно) | 12 | `browser_fingerprint`, `user_agent`, `browser_name/version`, `os_type/version`, `screen_resolution`, `screen_color_depth`, `system_language`, `webgl_vendor`, `canvas_fingerprint`, `audio_fingerprint` |
+| Privacy / security флаги | 6 | `is_developer_tools`, `is_headless_browser`, `is_incognito`, `is_vpn_detected`, `is_proxy_detected`, `is_tor_detected` |
+| Network (per-session) | 5 | `ip_address_hash`, `connection_type`, `network_rtt_avg_ms`, `asn`, `isp_name` |
+| Mouse биометрика | 4 | `mouse_velocity_avg`, `mouse_acceleration_avg`, `mouse_jitter_score`, `mouse_linearity_score` |
+| Click / scroll | 4 | `click_duration_avg_ms`, `right_click_count`, `scroll_velocity_avg`, `double_click_count` |
+| Keyboard биометрика | 3 | `keyboard_typing_speed_median_ms`, `keyboard_typing_speed_std_dev`, `keyboard_typing_rhythm_cv` |
+| Form interactions | 13 | `backspace_ratio`, `clipboard_paste_ratio`, `copy_events_count`, `paste_events_count`, `tab_switch_count`, `focus_blur_count`, `form_fill_duration_sec`, `idle_time_before_submit_sec`, `error_correction_ratio`, `hover_time_avg_ms`, `drag_drop_events`, `resize_events_count`, `zoom_level` |
+| Session shape | 2 | `session_duration_sec`, `pages_visited_count` |
+| Login / trust | 6 | `login_method`, `failed_login_attempts`, `time_since_last_login_sec`, `is_new_device`, `is_new_browser`, `device_trust_score` |
+| Temporal (из `event_dttm`) | 3 | `hour_of_day`, `day_of_week`, `timezone_offset` |
+| Transaction enrichment | 2 | `merchant_name`, `transaction_type` |
+| Misc | 1 | `installed_fonts_count` |
+
+⚠ Часть source-полей (`os_type`, `os_version`, `screen_resolution`, `timezone_offset`, `browser_language`, `accept_language`) при наличии в исходниках берётся passthrough'ем, иначе генерируется детерминированно.
 
 ## Производные артефакты в `data_augmented/`
 
-Дополнительно после прогона `python3 -m trainer.cli all`:
+Дополнительно после прогона `python3 -m trainer.cli all` (или `aggregate` / `extract` по отдельности):
 
-### `customer_features.parquet` — 100 000 строк × 24 колонок (9.7 MB)
+### `customer_features.parquet` — 100 000 строк × 50 колонок (customer_id + 49 агрегатов)
 
-Per-customer агрегаты по объединению `pretrain + train + pretest` (108 M строк), потоково. Используются как контекст истории клиента при инференсе.
+Per-customer агрегаты по объединению `pretrain + train + pretest` (108 M строк), потоково. Используются как контекст истории клиента при инференсе. Полный список — в `trainer/aggregate.py::FEATURE_COLUMNS`.
 
 | Группа | Колонки |
 |---|---|
 | **Идентификатор** | `customer_id` |
-| **Счётчики** | `event_count` |
-| **Суммы операций** | `amt_mean`, `amt_std`, `amt_max`, `amt_log_mean` |
-| **Существующие риск-флаги (доли)** | `compromised_share`, `web_rdp_share`, `developer_tools_share`, `phone_voip_share` |
-| **Синтетические числовые (средние)** | `mean_app_background_events`, `mean_clipboard_paste`, `mean_typing_rhythm`, `mean_rtt`, `mean_storage_free`, `mean_screen_orientation` |
-| **Синтетические бинарные (доли)** | `biometric_share`, `debugger_share`, `sim_mismatch_share` |
-| **Производные доли** | `attestation_failed_share`, `vpn_tor_share` |
+| **Счётчики / суммы** | `event_count`, `amt_mean`, `amt_std`, `amt_max`, `amt_log_mean` |
+| **Privacy флаги (доли)** | `dev_tools_share`, `headless_share`, `incognito_share`, `vpn_share`, `proxy_share`, `tor_share` |
+| **Trust флаги (доли)** | `new_device_share`, `new_browser_share` |
+| **Network** | `mean_rtt` |
+| **Mouse биометрика (средние)** | `mean_mouse_velocity`, `mean_mouse_accel`, `mean_mouse_jitter`, `mean_mouse_linearity` |
+| **Click / scroll (средние)** | `mean_click_duration`, `mean_right_clicks`, `mean_scroll_velocity`, `mean_double_click` |
+| **Keyboard биометрика (средние)** | `mean_typing_median_ms`, `mean_typing_std`, `mean_typing_cv` |
+| **Form interactions (средние)** | `mean_backspace`, `mean_clipboard_paste`, `mean_copy_events`, `mean_paste_events`, `mean_tab_switch`, `mean_focus_blur`, `mean_form_fill`, `mean_idle_before_submit`, `mean_error_correction`, `mean_hover_time`, `mean_drag_drop`, `mean_resize_events`, `mean_zoom_level` |
+| **Session shape (средние)** | `mean_session_duration`, `mean_pages_visited` |
+| **Прочее (средние)** | `mean_installed_fonts`, `mean_failed_logins`, `mean_time_since_login`, `mean_device_trust` |
+| **Категориальные доли** | `foreign_isp_share`, `mobile_os_share` |
 | **Временные** | `hours_span` (max−min event_dttm в часах), `night_ops_share` (часы 0-5), `weekend_share` |
 
-### `labelled_events.parquet` — 87 514 строк × 37 колонок (5.6 MB)
+### `labelled_events.parquet` — 87 514 строк × 72 колонки (71 task.md + `target`)
 
-Inner-join `data_augmented/train_part_*.parquet` с `data/train_labels.parquet` по `(customer_id, event_id)`. Содержит все 36 колонок augmented-набора + колонку `target ∈ {0, 1}`. Используется как готовый supervised тренировочный набор.
+Inner-join `data_augmented/train_part_*.parquet` с `data/train_labels.parquet` по `(customer_id, event_id)`. Содержит все 71 колонок augmented-набора + колонку `target ∈ {0, 1}`. Используется как готовый supervised тренировочный набор.
 
 ## Формат submission
 
@@ -144,7 +153,7 @@ event_id,predict
 ## Pipeline для воспроизведения
 
 ```bash
-# 1. Добавить 13 синтетических признаков в data_augmented/
+# 1. Сгенерировать augmented-схему task.md (71 колонка) в data_augmented/
 python3 -m feature_generator.cli
 
 # 2. Построить агрегаты и labelled-набор + обучить модель
