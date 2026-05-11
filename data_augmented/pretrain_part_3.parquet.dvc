@@ -1,5 +1,0 @@
-outs:
-- md5: 8704bd9ae2f489af84587f1fcc831304
-  size: 4193617544
-  hash: md5
-  path: pretrain_part_3.parquet
