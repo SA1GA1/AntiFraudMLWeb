@@ -1,6 +1,7 @@
 [core]
     remote = local
     autostage = true
-
+[cache]
+    type = "reflink,hardlink,symlink,copy"
 ['remote "local"']
     url = /home/clever/fraud/dvc-cache
