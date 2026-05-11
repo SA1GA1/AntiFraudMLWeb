@@ -1,0 +1,25 @@
+# Parameters consumed by dvc.yaml stages. Override per-environment via
+# `dvc exp run -S key=value` or by editing this file locally (do not commit
+# host-specific values).
+#
+# Dev defaults below point at /home/clever/fraud — the local working tree
+# created during initial setup. Production deployments override these via
+# env-driven flags in `orchestration/daily_flow.py` (see FRAUD_ROOT etc.).
+
+# Input data
+events_glob: /home/clever/fraud/events/dt=*/*.parquet
+labels_glob: /home/clever/fraud/labels/dt=*/*.parquet
+label_window_end: "2026-05-04"   # today() - 7 days; daily_flow overrides at runtime
+
+# Local working directories
+data_dir: data_augmented
+state_path: /home/clever/fraud/state/customer_features.state.parquet
+output_dir: trainer/checkpoints
+
+# Training
+epochs: 20
+
+# MLFlow
+mlflow_uri: file:///home/clever/fraud/mlruns
+mlflow_experiment: fraud_mlp_web
+model_name: fraud_mlp_web

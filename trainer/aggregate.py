@@ -1,10 +1,18 @@
 """Потоковая агрегация клиентских признаков из data_augmented/.
 
 Все колонки соответствуют web-fraud схеме task.md (71 признак).
+
+Поддерживает два режима:
+- **full** (по умолчанию) — пересчёт по всем переданным файлам с нуля.
+- **incremental** — догружает persisted state (raw sums + extremes) и
+  применяет только новые партиции, сохраняя обновлённый state. Это нужно
+  для daily flow, где `events/dt=YYYY-MM-DD/` пополняется без полного
+  rescan'а 108M строк.
 """
 
 from __future__ import annotations
 
+import glob
 from pathlib import Path
 from typing import Iterable
 
@@ -139,12 +147,41 @@ _SUM_COLS_FROM_BATCH = (
 )
 
 
+_STATE_EXTRA_COLS = ("__max_amt", "__min_ts", "__max_ts")
+
+
 class CustomerAggregator:
     def __init__(self) -> None:
         self._sums: pd.DataFrame | None = None
         self._max_amt: pd.Series | None = None
         self._min_ts: pd.Series | None = None
         self._max_ts: pd.Series | None = None
+
+    # ------------------------------------------------------------------
+    # Persistence — for incremental daily runs.
+    # ------------------------------------------------------------------
+
+    def save_state(self, path: Path) -> None:
+        if self._sums is None:
+            raise RuntimeError("Nothing to save — aggregator received no batches.")
+        state = self._sums.copy()
+        state["__max_amt"] = self._max_amt.reindex(state.index)
+        state["__min_ts"] = self._min_ts.reindex(state.index)
+        state["__max_ts"] = self._max_ts.reindex(state.index)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state.reset_index().to_parquet(str(path), compression="snappy", index=False)
+
+    @classmethod
+    def load_state(cls, path: Path) -> "CustomerAggregator":
+        agg = cls()
+        if not path.exists():
+            return agg
+        df = pq.read_table(str(path)).to_pandas().set_index("customer_id")
+        agg._max_amt = df["__max_amt"]
+        agg._min_ts = df["__min_ts"]
+        agg._max_ts = df["__max_ts"]
+        agg._sums = df.drop(columns=list(_STATE_EXTRA_COLS))
+        return agg
 
     def process(self, df: pd.DataFrame) -> None:
         df = _prepare_batch(df)
@@ -272,25 +309,73 @@ def _iter_batches(paths: Iterable[Path], batch_rows: int = 200_000):
             written += len(df)
 
 
-def build_customer_features(
-    input_dir: Path,
-    output_path: Path,
-    sources: list[str] | None = None,
-    batch_rows: int = 200_000,
-    progress: bool = True,
-) -> pd.DataFrame:
+def _resolve_aggregate_paths(
+    input_dir: Path | None,
+    sources: list[str] | None,
+    events_glob: str | Iterable[str] | None,
+) -> list[Path]:
+    if events_glob:
+        patterns = [events_glob] if isinstance(events_glob, str) else list(events_glob)
+        paths: list[Path] = []
+        for pat in patterns:
+            paths.extend(Path(p) for p in sorted(glob.glob(pat)))
+        return paths
+    if input_dir is None:
+        raise ValueError("Either events_glob or input_dir must be provided.")
     if sources is None:
         sources = [
             "pretrain_part_1.parquet", "pretrain_part_2.parquet", "pretrain_part_3.parquet",
             "train_part_1.parquet", "train_part_2.parquet", "train_part_3.parquet",
             "pretest.parquet",
         ]
-    paths = [input_dir / s for s in sources]
+    return [input_dir / s for s in sources]
+
+
+def build_customer_features(
+    input_dir: Path | None = None,
+    output_path: Path = Path("customer_features.parquet"),
+    sources: list[str] | None = None,
+    *,
+    events_glob: str | Iterable[str] | None = None,
+    incremental: bool = False,
+    state_path: Path | None = None,
+    batch_rows: int = 200_000,
+    progress: bool = True,
+) -> pd.DataFrame:
+    """Build per-customer aggregates from event parquets.
+
+    Parameters
+    ----------
+    input_dir, sources :
+        Legacy mode — directory + filename list inside it.
+    events_glob :
+        Production mode — one or more glob patterns like
+        ``"/var/fraud/events/dt=2026-05-*/part-*.parquet"``. Sorted lexically
+        so file order is deterministic.
+    incremental, state_path :
+        If ``incremental=True``, prior raw sums are loaded from ``state_path``
+        (created on a previous run via ``CustomerAggregator.save_state``).
+        ``paths`` should then contain ONLY new partitions; passing already-
+        processed files would double-count them.
+    """
+    paths = _resolve_aggregate_paths(input_dir, sources, events_glob)
     for p in paths:
         if not p.exists():
             raise FileNotFoundError(p)
 
-    agg = CustomerAggregator()
+    if incremental:
+        if state_path is None:
+            raise ValueError("incremental=True requires state_path.")
+        agg = CustomerAggregator.load_state(state_path)
+        if progress and agg._sums is not None:
+            print(f"[aggregate] resumed state from {state_path} "
+                  f"({len(agg._sums):,} customers)")
+    else:
+        agg = CustomerAggregator()
+
+    if not paths:
+        if progress:
+            print("[aggregate] no input parquets — nothing to process")
     cur_file = None
     for fname, df, total, written in _iter_batches(paths, batch_rows):
         if progress and fname != cur_file:
@@ -299,8 +384,14 @@ def build_customer_features(
         agg.process(df)
         if progress:
             print(f"  ... {written:,}/{total:,}", end="\r")
-    if progress:
+    if progress and cur_file is not None:
         print()
+
+    if incremental and state_path is not None and agg._sums is not None:
+        agg.save_state(state_path)
+        if progress:
+            print(f"[aggregate] saved state -> {state_path}")
+
     feats = agg.finalize()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     feats.to_parquet(str(output_path), compression="snappy", index=False)

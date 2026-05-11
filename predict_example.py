@@ -1,9 +1,14 @@
-"""Пример использования обученной модели FraudMLP.
+"""[DEPRECATED — dev/debug only]  Пример использования FraudMLP-чекпоинта.
+
+Production-инференс уехал в AntiFraudMain, который грузит модель через
+``mlflow.pyfunc.load_model("models:/fraud_mlp_web/Production")``. Этот скрипт
+читает локальный ``trainer/checkpoints/best.pt`` напрямую и оставлен для
+быстрой проверки модели после ``python -m trainer.cli train``.
 
 Запуск:
     python3 predict_example.py
 
-Скрипт показывает два сценария:
+Сценарии:
   1. Batch-инференс по test.parquet с записью submission.csv
   2. Предсказание для одного вручную построенного события
 """

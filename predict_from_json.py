@@ -1,4 +1,8 @@
-"""Минимальный пример: читает массив событий из JSON и печатает P(fraud) по каждому с замером времени inference.
+"""[DEPRECATED — dev/debug only]  JSON-инференс из чекпоинта.
+
+Production-инференс уехал в AntiFraudMain (``mlflow.pyfunc.load_model``).
+Этот скрипт оставлен как dev-утилита для разработки фичей и быстрой
+проверки чекпоинта на готовом JSON-payload'е.
 
 Запуск:
     python3 predict_from_json.py predict_input_example.json

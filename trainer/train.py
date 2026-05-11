@@ -4,8 +4,11 @@ train FraudMLP, save best checkpoint + per-epoch metrics."""
 from __future__ import annotations
 
 import json
+import os
 import pickle
+import subprocess
 import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,14 @@ class TrainConfig:
     seed: int = 42
     num_workers: int = 2
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # MLFlow integration — все поля опциональные; если mlflow_uri is None,
+    # вся трекинг-логика становится no-op'ом и mlflow в рантайме не требуется.
+    mlflow_uri: str | None = None
+    mlflow_experiment: str = "fraud_mlp_web"
+    mlflow_run_name: str | None = None
+    registered_model_name: str | None = None  # e.g. "fraud_mlp_web"
+    data_hash: str | None = None  # tag, прокидывается из daily_flow / DVC
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +122,85 @@ def _materialise(
     return num, cat, agg, has_hist
 
 
+def _git_sha() -> str | None:
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        )
+        return out.decode().strip()
+    except Exception:
+        return None
+
+
+class _Tracker:
+    """Thin adapter over mlflow — no-op if config.mlflow_uri is None."""
+
+    def __init__(self, config: TrainConfig) -> None:
+        self.enabled = bool(config.mlflow_uri)
+        self._mlflow = None
+        if not self.enabled:
+            return
+        try:
+            import mlflow  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                "mlflow_uri set but `mlflow` is not installed. "
+                "Either pip install mlflow or drop the --mlflow-uri flag."
+            ) from e
+        mlflow.set_tracking_uri(config.mlflow_uri)
+        mlflow.set_experiment(config.mlflow_experiment)
+        self._mlflow = mlflow
+
+    @contextmanager
+    def start_run(self, run_name: str | None = None):
+        if not self.enabled:
+            yield None
+            return
+        with self._mlflow.start_run(run_name=run_name) as run:
+            yield run
+
+    def log_params(self, params: dict) -> None:
+        if self.enabled:
+            # mlflow требует строки/числа
+            safe = {k: ("" if v is None else v) for k, v in params.items()}
+            self._mlflow.log_params(safe)
+
+    def set_tag(self, key: str, value: str | None) -> None:
+        if self.enabled and value:
+            self._mlflow.set_tag(key, value)
+
+    def log_metrics(self, metrics: dict, step: int) -> None:
+        if self.enabled:
+            clean = {k: float(v) for k, v in metrics.items()
+                     if v is not None and np.isfinite(v)}
+            if clean:
+                self._mlflow.log_metrics(clean, step=step)
+
+    def log_pyfunc(
+        self,
+        checkpoint_path: Path,
+        customer_features_path: Path | None,
+        registered_model_name: str | None,
+    ) -> str | None:
+        if not self.enabled:
+            return None
+        from .pyfunc import FraudPyfunc  # lazy: mlflow required at import time
+
+        artifacts: dict[str, str] = {"checkpoint": str(checkpoint_path)}
+        if customer_features_path and customer_features_path.exists():
+            artifacts["customer_features"] = str(customer_features_path)
+
+        trainer_dir = Path(__file__).resolve().parent
+        info = self._mlflow.pyfunc.log_model(
+            artifact_path="model",
+            python_model=FraudPyfunc(),
+            artifacts=artifacts,
+            code_paths=[str(trainer_dir)],
+            registered_model_name=registered_model_name,
+        )
+        return info.model_uri
+
+
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -127,6 +217,34 @@ def train(
     torch.manual_seed(config.seed)
     np.random.seed(config.seed)
 
+    tracker = _Tracker(config)
+    run_name = config.mlflow_run_name or (
+        f"fraud_mlp_e{config.epochs}_d{config.agg_dropout:.2f}_s{config.seed}"
+    )
+
+    with tracker.start_run(run_name=run_name):
+        tracker.log_params(asdict(config))
+        tracker.set_tag("git_sha", _git_sha())
+        tracker.set_tag("data_hash", config.data_hash)
+        tracker.set_tag("device", config.device)
+        return _train_impl(
+            labelled_path=labelled_path,
+            aggregates_path=aggregates_path,
+            output_dir=output_dir,
+            config=config,
+            tracker=tracker,
+            progress=progress,
+        )
+
+
+def _train_impl(
+    labelled_path: Path,
+    aggregates_path: Path | None,
+    output_dir: Path,
+    config: TrainConfig,
+    tracker: _Tracker,
+    progress: bool,
+) -> dict[str, Any]:
     if progress:
         print(f"[train] device: {config.device}")
         print(f"[train] loading labelled events from {labelled_path}")
@@ -258,6 +376,18 @@ def train(
         with open(metrics_path, "w") as f:
             json.dump({"config": asdict(config), "history": history}, f, indent=2)
 
+        tracker.log_metrics(
+            {
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "val_auc": auc,
+                "val_pr_auc": pr_auc,
+                "lr": entry["lr"],
+                "epoch_secs": dt,
+            },
+            step=epoch,
+        )
+
         if auc > best_auc:
             best_auc = auc
             torch.save(
@@ -277,5 +407,18 @@ def train(
             if progress:
                 print(f"[train]   ✓ new best AUC={auc:.4f}, saved -> {best_path}")
 
-    return {"best_auc": best_auc, "history": history, "best_path": str(best_path),
-            "metrics_path": str(metrics_path)}
+    model_uri = tracker.log_pyfunc(
+        checkpoint_path=best_path,
+        customer_features_path=aggregates_path,
+        registered_model_name=config.registered_model_name,
+    )
+    if progress and model_uri:
+        print(f"[train] logged pyfunc model -> {model_uri}")
+
+    return {
+        "best_auc": best_auc,
+        "history": history,
+        "best_path": str(best_path),
+        "metrics_path": str(metrics_path),
+        "model_uri": model_uri,
+    }

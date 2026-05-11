@@ -54,24 +54,43 @@ AntiFraudMLWeb/
 ├── data_augmented/                # 8 augmented файлов (71 task.md колонка)
 │   ├── *.parquet
 │   ├── customer_features.parquet  # 100 K клиентов × 49 агрегатов
+│   ├── customer_features.state.parquet  # raw sums для incremental aggregate
 │   └── labelled_events.parquet    # 87 514 размеченных событий с фичами
-├── feature_generator/             # Этап 1: 71-колоночная task.md схема
+├── feature_generator/             # Этап 1 (DEV/CI only): синтетические признаки
 ├── trainer/                       # Этап 2: обучение MLP
 │   ├── checkpoints/
 │   │   ├── best.pt                # чекпоинт + pickled preprocessor
 │   │   └── metrics.json           # история метрик
+│   ├── pyfunc.py                  # MLFlow PyFunc wrapper для inference
 │   └── ...
-├── predict_example.py             # Пример инференса — пишет submission.csv
-├── predict_from_json.py           # Инференс по JSON-массиву событий
+├── orchestration/                 # Этап 4: Prefect daily flow + промоушен
+│   ├── daily_flow.py
+│   ├── deployment.py              # cron-расписание
+│   ├── promote.py                 # AUC-gate перед Production
+│   ├── notify.py                  # POST /admin/reload-model в AntiFraudMain
+│   └── config.py                  # env-driven параметры
+├── dvc.yaml, params.yaml, .dvc/   # DVC pipeline + remote
+├── predict_example.py             # [DEPRECATED] локальный inference c best.pt
+├── predict_from_json.py           # [DEPRECATED] JSON-инференс
 ├── predict_input_example.json     # Демо payload (web-fraud схема)
 ├── test1.json / test2_new_customer.json / test3_collision.json  # тесты
 ├── submission.csv                 # Результат инференса по test.parquet
 ├── task.md                        # ЦЕЛЕВАЯ схема (71 колонка)
 ├── DATA.md                        # Описание исходных данных
+├── update.md                      # MLOps-обсуждение (MLFlow/Prefect/DVC)
 └── CLAUDE.md                      # Этот файл
 ```
 
-## Этап 1 — feature_generator
+## Этап 1 — feature_generator (DEV / CI only)
+
+**В production-пайплайне не вызывается.** Используется для:
+- генерации seed-датасета новым разработчикам, у которых нет доступа к
+  реальным данным;
+- smoke-тестов препроцессора и trainer'а в CI;
+- воспроизведения исходного синтетического baseline'а.
+
+В ежедневном retrain'е (`orchestration/daily_flow.py`) на его место становится
+parquet-партиции от `AntiFraudMain` (`/var/fraud/events/dt=*/...`).
 
 Генерирует web-fraud признаки и записывает **только 71 колонку task.md**
 (старые исходные колонки в augmented parquet не сохраняются).
@@ -238,7 +257,7 @@ mouse/click/scroll/keyboard/form-метрики, session-shape, login-trust,
 синтетические фичи зависят от target). Это даёт AUC=1.0 — **по плану**,
 для baseline приемлемо.
 
-### Запуск
+### Запуск (legacy, на синтетике)
 
 ```bash
 python3 -m trainer.cli all          # aggregate → extract → train (~12 минут)
@@ -247,28 +266,37 @@ python3 -m trainer.cli extract      # только извлечение разм
 python3 -m trainer.cli train --epochs 20 --batch-size 4096   # только обучение
 ```
 
-## Этап 3 — predict
-
-Два сценария:
-
-### Batch — `predict_example.py`
+### Запуск (production, на партициях от backend)
 
 ```bash
-python3 predict_example.py
+# Инкрементальный пересчёт агрегатов по новым партициям
+python3 -m trainer.cli aggregate \
+  --events-glob "/var/fraud/events/dt=*/*.parquet" \
+  --incremental \
+  --state-path /var/fraud/state/customer_features.state.parquet
+
+# Извлечение размеченных событий с label-lag окном
+python3 -m trainer.cli extract \
+  --events-glob "/var/fraud/events/dt=*/*.parquet" \
+  --labels-glob "/var/fraud/labels/dt=*/*.parquet" \
+  --label-window-end 2026-05-04
+
+# Обучение с MLFlow-трекингом и регистрацией pyfunc
+python3 -m trainer.cli train \
+  --mlflow-uri file:///var/fraud/mlruns \
+  --registered-model-name fraud_mlp_web \
+  --data-hash $(dvc status --json | sha256sum | head -c 16)
 ```
 
-1. Загружает `best.pt`, восстанавливает `Preprocessor` из pickle.
-2. Batch-инференс по `data_augmented/test.parquet` → `submission.csv`.
-3. Demo: пара hardcoded событий (фрод vs норма) по task.md схеме.
+## Этап 3 — predict (DEPRECATED)
 
-### JSON — `predict_from_json.py`
+Production-инференс теперь живёт в `AntiFraudMain` и тянет модель из MLFlow
+Registry (`models:/fraud_mlp_web/Production`). См. `update.md` раздел 3.2 и
+`/home/clever/Documents/AntiFraud/AntiFraudMain/`.
 
-```bash
-python3 predict_from_json.py predict_input_example.json
-```
-
-Читает `{"events": [...]}` JSON. Каждое событие — словарь с полями task.md
-схемы. Печатает `logit`, `P(fraud)`, `has_history`, время инференса.
+`predict_example.py` / `predict_from_json.py` остаются в репо как
+**dev-утилиты** для быстрой проверки чекпоинта сразу после тренировки.
+Не использовать в production.
 
 Готовые payload-файлы для проверки модели:
 
@@ -278,11 +306,55 @@ python3 predict_from_json.py predict_input_example.json
 - `test3_collision.json` — «чистый» клиент с подозрительным событием
   (проверка, перетягивает ли история вердикт).
 
+## Этап 4 — daily retrain (Prefect / DVC / MLFlow)
+
+Ежедневный flow живёт в `orchestration/`. Запускается Prefect-агентом по
+cron'у (по умолчанию 03:00 Europe/Moscow). Шаги:
+
+1. `compute_data_hash` — отпечаток входных файлов (sha256 от path/size/mtime).
+2. `run_aggregate` — `python -m trainer.cli aggregate --incremental ...`.
+   Не пересобирает 108 M строк, дописывает только новые партиции.
+3. `run_extract` — окно меток `[today-30d, today-7d]` (лаг чарджбэков).
+4. `run_train` — обучение + MLFlow run + `mlflow.pyfunc.log_model(...)`
+   с регистрацией в Registry под именем `fraud_mlp_web`.
+5. `run_promote` — `validate_and_promote` в `orchestration/promote.py`:
+   новая версия становится Production только если `val_auc ≥ prod_auc − 0.005`.
+6. `run_notify` — POST `/admin/reload-model` в AntiFraudMain. Бэкенд
+   подтягивает новую модель из Registry без рестарта.
+
+Все пути и URL — env-driven (см. `orchestration/config.py`):
+`FRAUD_ROOT`, `FRAUD_EVENTS_GLOB`, `MLFLOW_TRACKING_URI`,
+`FRAUD_BACKEND_RELOAD_URL`, `FRAUD_CRON`, `FRAUD_CRON_TZ`, и т.д.
+
+DVC pipeline (`dvc.yaml` + `params.yaml`) дублирует те же стадии для
+ручного `dvc repro` — пропускает шаги, у которых deps не менялись.
+
+### Запуск daily flow
+
+```bash
+# Один раз — зарегистрировать deployment
+python3 -m orchestration.deployment
+
+# Запустить агента в фоне
+prefect worker start --pool default &
+
+# Принудительный прогон вручную (без cron'а)
+python3 -m orchestration.daily_flow
+```
+
 ## Окружение
 
-- Python 3.14, pandas 3.0.1, pyarrow 23.0.1, numpy 2.4.4, torch 2.9.1+cu130
+- Python 3.14, pandas 2.3.3 (downgraded mlflow constraint), pyarrow 23.0.1,
+  numpy 2.4.4, torch 2.9.1+cu130
+- mlflow 3.12, prefect 3.7, dvc 3.67 — установлены в ~/.local
 - GPU: NVIDIA RTX 4060 Laptop, 8.2 GB VRAM, CUDA available
 - Project root: `/home/clever/Documents/AntiFraud/AntiFraudMLWeb`
+- **Shared data root (dev):** `/home/clever/fraud/` — events, labels, state,
+  mlruns, dvc-cache. Override через `FRAUD_ROOT` env var.
+- **Production canonical:** `/var/fraud/` (требует sudo на этой машине).
+  Все примеры в коде используют `/var/fraud/` как иллюстрацию; реальные
+  дефолты в `params.yaml` / `.dvc/config` / `orchestration/config.py`
+  указывают на `/home/clever/fraud/`.
 - Никаких внешних БД нет — всё на parquet'ах в файловой системе
 
 ## Подводные камни (gotchas)
@@ -304,36 +376,58 @@ python3 predict_from_json.py predict_input_example.json
    `channel_indicator_type` и т.п.) в нём отсутствуют. Если нужны — читать
    из `data/`.
 
-## Дальнейшие улучшения (не реализованы)
+## Дальнейшие улучшения
+
+### Сделано
+
+- **MLFlow tracking + Model Registry** — `trainer/train.py` + `trainer/pyfunc.py`.
+- **DVC pipeline** — `dvc.yaml` + `params.yaml`.
+- **Prefect daily flow** — `orchestration/daily_flow.py`.
+- **Validation gate перед Production** — `orchestration/promote.py`.
+- **Hot-reload модели в бэкенде** — `orchestration/notify.py` →
+  `AntiFraudMain /admin/reload-model`.
+- **Инкрементальная агрегация** — `aggregate.save_state` / `load_state`.
+
+### Открытые направления
 
 - **Без утечки агрегатов:** считать аггрегаты по клиенту, исключая
   размеченные события (или используя time-based split).
-- **Сабмишен через CLI:** добавить `python -m trainer.cli predict` вместо
-  отдельного скрипта.
 - **Sequence-модель:** GRU/Transformer по истории клиента вместо плоского MLP.
 - **Time-based валидация:** холдаут по дате, а не stratified random.
 - **Semi-supervised pretrain:** masked-feature reconstruction на pretrain без меток.
 - **Real fingerprinting integration:** заменить синтетические canvas/audio/webgl
-  отпечатки данными из реального fingerprinting SDK.
+  отпечатки данными из реального fingerprinting SDK (см. `AntiFraudMain/update.md`).
+- **Evidently drift report** — добавить шаг в `daily_flow` после `extract`.
+- **Pandera schema validation** — единый контракт между backend и trainer.
 
 ## Полезные команды
 
 ```bash
-# Регенерация augmented файлов
+# Регенерация augmented файлов (dev/synthetic only)
 python3 -m feature_generator.cli
 
-# Полный цикл обучения с нуля
+# Полный цикл обучения с нуля (legacy)
 python3 -m trainer.cli all
 
-# Только инференс на test
+# Локальный inference c best.pt (dev only)
 python3 predict_example.py
-
-# JSON-инференс с замером времени
 python3 predict_from_json.py test1.json
+
+# Daily flow вручную
+python3 -m orchestration.daily_flow
+
+# DVC reproducible run (пересчёт только изменившихся стадий)
+dvc repro
+
+# MLFlow UI
+mlflow ui --backend-store-uri file:///var/fraud/mlruns
 
 # Проверка чекпоинта
 python3 -c "import torch; ck = torch.load('trainer/checkpoints/best.pt', weights_only=False); print('AUC:', ck['val_auc'], 'epoch:', ck['epoch'])"
 
 # Просмотр истории метрик
 python3 -c "import json; print(json.dumps(json.load(open('trainer/checkpoints/metrics.json'))['history'][-1], indent=2))"
+
+# Список версий в MLFlow Registry
+python3 -c "from mlflow.tracking import MlflowClient; c = MlflowClient('file:///var/fraud/mlruns'); print([(v.version, v.current_stage) for v in c.search_model_versions(\"name='fraud_mlp_web'\")])"
 ```
