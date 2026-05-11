@@ -11,57 +11,60 @@ import pandas as pd
 from .aggregate import FEATURE_COLUMNS as AGG_FEATURE_COLUMNS
 
 # ---------------------------------------------------------------------------
-# Схема: после task.md-перехода numeric и categorical обновлены.
+# Схема task.md (web-fraud, 71 признак). Numeric / Categorical для модели.
 # ---------------------------------------------------------------------------
 
 NUMERIC_COLS: List[str] = [
-    # Source numeric (task.md line 13)
-    "operaton_amt",                  # log1p-transformed
-    # Task.md флаги (0/1) и числовые
-    "is_rooted_jailbroken",
-    "is_emulator",
-    "is_debugger_attached",
-    "developer_tools_enabled",
-    "is_vpn_detected",
-    "is_proxy_detected",
-    "biometric_entry_used",
-    "network_rtt_avg_ms",
-    "accuracy_meters",
-    "geo_speed_km_h",
-    "timezone_offset_minutes",
-    "latitude",
-    "longitude",
-    "touch_typing_rhythm_median_ms",
-    "touch_typing_rhythm_std_dev",
-    "touch_typing_rhythm_cv",
-    "tap_velocity_avg",
-    "tap_pressure_avg",
-    "touch_jitter_score",
-    "swipe_angle_deviation",
-    "clipboard_paste_ratio",
-    "backspace_ratio",
-    "form_fill_duration_sec",
-    "app_background_events",
-    "screen_orientation_changes",
-    "accelerometer_variance_x",
-    "accelerometer_variance_y",
-    "gyroscope_variance",
-    "battery_level",
-    "storage_free_percent",
-    "carrier_mcc",
-    "carrier_mnc",
+    # Source numeric + log-transformed
+    "operaton_amt",
+    # Бинарные task.md (0/1)
+    "is_developer_tools", "is_headless_browser", "is_incognito",
+    "is_vpn_detected", "is_proxy_detected", "is_tor_detected",
+    "is_new_device", "is_new_browser", "biometric_login",
+    # Network / fingerprints
+    "network_rtt_avg_ms", "screen_color_depth", "installed_fonts_count",
+    "timezone_offset",
+    # Mouse
+    "mouse_velocity_avg", "mouse_acceleration_avg",
+    "mouse_jitter_score", "mouse_linearity_score",
+    # Click / scroll
+    "click_duration_avg_ms", "right_click_count", "scroll_velocity_avg",
+    # Keyboard
+    "keyboard_typing_speed_median_ms", "keyboard_typing_speed_std_dev",
+    "keyboard_typing_rhythm_cv",
+    # Clipboard / interactions
+    "backspace_ratio", "clipboard_paste_ratio",
+    "copy_events_count", "paste_events_count",
+    "tab_switch_count", "focus_blur_count",
+    "form_fill_duration_sec", "idle_time_before_submit_sec",
+    "error_correction_ratio", "hover_time_avg_ms",
+    "double_click_count", "drag_drop_events",
+    "resize_events_count", "zoom_level",
+    # Session shape
+    "session_duration_sec", "pages_visited_count",
+    # Login / trust
+    "failed_login_attempts", "time_since_last_login_sec",
+    "device_trust_score",
+    # Network identifiers
+    "asn",
 ]
 
 CATEGORICAL_COLS: List[str] = [
-    # Source категориальные task.md (lines 14, 15, 17)
+    # Source categorical (task.md)
     "currency_iso_cd", "mcc_code", "pos_cd",
-    # Task.md категориальные
-    "attestation_status", "transaction_type",
-    "app_version", "os_type", "os_version", "device_model",
-    "merchant_name", "app_install_source", "integrity_token",
-    "connection_type", "carrier_name", "sim_country_code",
-    "sim_carrier_name", "location_provider", "battery_charging_state",
-    # Temporal task.md (lines 11, 12)
+    # Browser identity
+    "browser_name", "browser_version", "os_type", "os_version",
+    "screen_resolution", "system_language",
+    "browser_language", "accept_language",
+    # Transaction / merchant
+    "merchant_name", "transaction_type",
+    # Network
+    "connection_type", "isp_name",
+    # Fingerprints (high-card but bucketed via vocab cap)
+    "webgl_vendor",
+    # Login
+    "login_method",
+    # Temporal
     "hour_of_day", "day_of_week",
 ]
 
@@ -71,7 +74,6 @@ _NAN_TOKEN: str = "__NAN__"
 
 
 def _temporal_categoricals(dttm: pd.Series) -> dict[str, pd.Series]:
-    """Derive hour_of_day / day_of_week from event_dttm as string-typed series."""
     dt = pd.to_datetime(dttm, errors="coerce", utc=False)
     hour = dt.dt.hour.fillna(12).astype(np.int16).astype(str)
     dow = dt.dt.dayofweek.fillna(0).astype(np.int16).astype(str)
@@ -80,35 +82,53 @@ def _temporal_categoricals(dttm: pd.Series) -> dict[str, pd.Series]:
 
 def _prepare_event_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # log1p amount
-    out["operaton_amt"] = np.log1p(pd.to_numeric(out["operaton_amt"], errors="coerce").fillna(0).clip(lower=0))
-    # Task.md is_* флаги — приходят уже int, на всякий случай нормализуем
-    for c in ("is_rooted_jailbroken", "is_emulator", "is_debugger_attached",
-              "developer_tools_enabled", "is_vpn_detected", "is_proxy_detected",
-              "biometric_entry_used"):
+    # log1p amount.
+    out["operaton_amt"] = np.log1p(
+        pd.to_numeric(out["operaton_amt"], errors="coerce").fillna(0).clip(lower=0)
+    )
+
+    # Бинарные флаги.
+    for c in ("is_developer_tools", "is_headless_browser", "is_incognito",
+              "is_vpn_detected", "is_proxy_detected", "is_tor_detected",
+              "is_new_device", "is_new_browser"):
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).astype(np.float32).clip(0, 1)
         else:
             out[c] = np.float32(0.0)
-    # Task.md числовые
+
+    # Производный флаг biometric_login = (login_method == 'biometric').
+    if "login_method" in out.columns:
+        out["biometric_login"] = (out["login_method"].astype(str).fillna("") == "biometric").astype(np.float32)
+    else:
+        out["biometric_login"] = np.float32(0.0)
+
+    # Числовые task.md.
     numeric_to_float = [
-        "network_rtt_avg_ms", "accuracy_meters", "geo_speed_km_h",
-        "timezone_offset_minutes", "latitude", "longitude",
-        "touch_typing_rhythm_median_ms", "touch_typing_rhythm_std_dev",
-        "touch_typing_rhythm_cv", "tap_velocity_avg", "tap_pressure_avg",
-        "touch_jitter_score", "swipe_angle_deviation", "clipboard_paste_ratio",
-        "backspace_ratio", "form_fill_duration_sec", "app_background_events",
-        "screen_orientation_changes", "accelerometer_variance_x",
-        "accelerometer_variance_y", "gyroscope_variance", "battery_level",
-        "storage_free_percent", "carrier_mcc", "carrier_mnc",
+        "network_rtt_avg_ms", "screen_color_depth", "installed_fonts_count",
+        "timezone_offset", "asn",
+        "mouse_velocity_avg", "mouse_acceleration_avg",
+        "mouse_jitter_score", "mouse_linearity_score",
+        "click_duration_avg_ms", "right_click_count", "scroll_velocity_avg",
+        "keyboard_typing_speed_median_ms", "keyboard_typing_speed_std_dev",
+        "keyboard_typing_rhythm_cv",
+        "backspace_ratio", "clipboard_paste_ratio",
+        "copy_events_count", "paste_events_count",
+        "tab_switch_count", "focus_blur_count",
+        "form_fill_duration_sec", "idle_time_before_submit_sec",
+        "error_correction_ratio", "hover_time_avg_ms",
+        "double_click_count", "drag_drop_events",
+        "resize_events_count", "zoom_level",
+        "session_duration_sec", "pages_visited_count",
+        "failed_login_attempts", "time_since_last_login_sec",
+        "device_trust_score",
     ]
     for c in numeric_to_float:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").astype(np.float32)
         else:
             out[c] = np.float32(0.0)
-    # Временные категориальные: предпочесть колонки из augmented parquet,
-    # иначе вывести из event_dttm. Безусловный concat создавал бы дубликаты.
+
+    # Временные категориальные.
     has_h = "hour_of_day" in out.columns and out["hour_of_day"].notna().any()
     has_d = "day_of_week" in out.columns and out["day_of_week"].notna().any()
     if has_h:
@@ -131,7 +151,8 @@ def _prepare_event_columns(df: pd.DataFrame) -> pd.DataFrame:
         out["hour_of_day"] = "12"
     if "day_of_week" not in out.columns:
         out["day_of_week"] = "0"
-    # Все категориальные приводим к строкам
+
+    # Все категориальные — в строки.
     for c in CATEGORICAL_COLS:
         if c in out.columns:
             out[c] = out[c].astype("string").fillna(_NAN_TOKEN)

@@ -1,12 +1,13 @@
 # feature_generator
 
-Augments the hackathon banking-fraud dataset with **13 synthetic features**
-describing device integrity, behavioural biometrics, and network signals.
-Output parquet files can be fed directly to a neural network for training.
+Augments the source banking dataset with the **71-column web-fraud schema**
+defined in `task.md` (browser identity, mouse/keyboard biometrics, network,
+device fingerprints, login/trust). The augmented parquet replaces the source
+columns — output contains exactly the 71 columns from `task.md`.
 
 ## Usage
 
-From the repo root (`/home/clever/Documents/ITParkHackathon`):
+From the repo root:
 
 ```bash
 # Augment every *.parquet in data/ → data_augmented/
@@ -24,32 +25,58 @@ python3 -m feature_generator.cli \
     --batch-rows 200000
 ```
 
-The CLI streams each source file in row-group batches, so even the 688 MB
+The CLI streams each source file row-group by row-group; even the 688 MB
 train parts run with bounded RAM.
 
 ## Determinism
 
-All draws come from a SplitMix64 hash of (key, salt, seed) where the key is
+All draws come from a SplitMix64 hash of `(key, salt, seed)` where the key is
 `customer_id`, `session_id`, or `event_id` depending on the feature. Re-running
 with the same seed produces a byte-identical parquet file.
 
-## What gets generated
+## Schema (71 columns from task.md)
 
-| Column | Type | Key | Behaviour |
-|---|---|---|---|
-| `attestation_status` | str | customer_id | passed / failed_root / emulator / modified_firmware — biased by risk and `compromised` |
-| `app_background_events` | int32 | session_id | count of app backgrounding events; higher under fraud / RDP |
-| `clipboard_paste_ratio_mobile` | float32 [0,1] | session_id | share of input that was pasted; higher under fraud |
-| `entry_source` | str | event_id | manual / push / deeplink / sms_link |
-| `connection_type` | str | session_id | wifi_home / cellular / wifi_public / vpn / tor |
-| `touch_typing_rhythm` | float32 | session_id | coefficient of variation of inter-key intervals — bots show near-zero |
-| `sim_country_mismatch` | int8 (0/1) | customer_id | SIM country vs IP/timezone mismatch flag |
-| `network_rtt_avg` | float32 (ms) | session_id | average RTT to bank server; higher via tunnels |
-| `biometric_entry_used` | int8 (0/1) | customer_id + event_id | FaceID/TouchID used; capability stable per customer, usage per event |
-| `storage_free_percent` | float32 [0.5, 99.5] | customer_id + event_id | free storage; lower for fraud-y devices |
-| `battery_charging_state` | str | event_id (+ existing `battery`) | discharging / charging / full / plugged_24_7 |
-| `screen_orientation_changes` | int32 | session_id | count of orientation changes; higher under RDP |
-| `debugger_attached` | int8 (0/1) | event_id | strongly elevated under fraud or developer_tools=1 |
+Identity + passthrough from source: `customer_id`, `event_id`, `session_id`,
+`event_dttm`, `operaton_amt`, `currency_iso_cd`, `mcc_code`, `pos_cd`,
+`browser_language`, `accept_language`.
+
+Browser identity (per-customer stable): `browser_fingerprint`, `user_agent`,
+`browser_name`, `browser_version`, `os_type`, `os_version`,
+`screen_resolution`, `screen_color_depth`, `system_language`,
+`webgl_vendor`, `canvas_fingerprint`, `audio_fingerprint`.
+
+Security/privacy flags (event/session, risk-biased): `is_developer_tools`,
+`is_headless_browser`, `is_incognito`, `is_vpn_detected`, `is_proxy_detected`,
+`is_tor_detected`.
+
+Network (per-session): `ip_address_hash`, `connection_type`,
+`network_rtt_avg_ms`, `asn`, `isp_name`.
+
+Mouse biometrics (per-session, bot bias): `mouse_velocity_avg`,
+`mouse_acceleration_avg`, `mouse_jitter_score`, `mouse_linearity_score`.
+
+Click / scroll: `click_duration_avg_ms`, `right_click_count`,
+`scroll_velocity_avg`, `double_click_count`.
+
+Keyboard biometrics: `keyboard_typing_speed_median_ms`,
+`keyboard_typing_speed_std_dev`, `keyboard_typing_rhythm_cv`.
+
+Form interactions (per-session): `backspace_ratio`, `clipboard_paste_ratio`,
+`copy_events_count`, `paste_events_count`, `tab_switch_count`,
+`focus_blur_count`, `form_fill_duration_sec`, `idle_time_before_submit_sec`,
+`error_correction_ratio`, `hover_time_avg_ms`, `drag_drop_events`,
+`resize_events_count`, `zoom_level`.
+
+Session shape: `session_duration_sec`, `pages_visited_count`.
+
+Login / trust (per-customer + per-event): `login_method`,
+`failed_login_attempts`, `time_since_last_login_sec`, `is_new_device`,
+`is_new_browser`, `device_trust_score`.
+
+Temporal (derived from `event_dttm`): `hour_of_day`, `day_of_week`,
+`timezone_offset`.
+
+Transaction enrichment: `merchant_name`, `transaction_type`.
 
 ## Risk model
 
@@ -57,39 +84,19 @@ Each row gets a *risk score* `r ∈ [0,1]`:
 
 * `target == 1` → `r = 0.85`
 * `target == 0` → `r = 0.10`
-* unknown (pre-train / pre-test / test) → clamped weighted sum of existing
-  on-device flags: `compromised`, `developer_tools`, `web_rdp_connection`,
-  `phone_voip_call_state`.
+* unknown → clipped weighted sum of source on-device flags
+  (`compromised`, `developer_tools`, `web_rdp_connection`,
+  `phone_voip_call_state`).
 
-All distributions are linearly interpolated between a "benign" and a "fraud"
-parameter set using `r`. Generators stay coherent with existing risk fields
-even when no label is available.
-
-## Verification (already passed)
-
-* On `test.parquet` (633 683 rows, no labels): 36 columns out, 0 nulls in
-  new columns, identical MD5 across reruns with the same seed.
-* On a 300 000-row sample of `train_part_1.parquet` joined to labels:
-
-  | Feature | target=0 mean | target=1 mean |
-  |---|---|---|
-  | app_background_events | 0.26 | 2.10 |
-  | clipboard_paste_ratio_mobile | 0.14 | 0.57 |
-  | touch_typing_rhythm | 0.40 | 0.29 |
-  | sim_country_mismatch | 0.05 | 0.55 |
-  | network_rtt_avg (ms) | 30 | 113 |
-  | biometric_entry_used | 0.40 | 0.08 |
-  | storage_free_percent | 69 | 25 |
-  | screen_orientation_changes | 0.40 | 3.28 |
-  | debugger_attached | 0.04 | 0.32 |
-  | attestation_status = passed | 90 % | 42 % |
+Continuous parameters are linearly interpolated between benign and fraud sets
+using `r`; binary flags use `Bernoulli(lerp(p_benign, p_fraud, r))`.
 
 ## Layout
 
 ```
 feature_generator/
 ├── __init__.py
-├── generators.py   # SplitMix64-keyed, vectorised samplers
+├── generators.py   # SplitMix64-keyed, vectorised samplers (71 columns)
 ├── augment.py      # row-group streaming reader/writer
 ├── cli.py          # argparse entrypoint (python -m feature_generator.cli)
 └── README.md

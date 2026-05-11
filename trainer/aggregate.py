@@ -1,4 +1,7 @@
-"""Потоковая агрегация клиентских признаков из data_augmented/."""
+"""Потоковая агрегация клиентских признаков из data_augmented/.
+
+Все колонки соответствуют web-fraud схеме task.md (71 признак).
+"""
 
 from __future__ import annotations
 
@@ -9,52 +12,82 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 
-# Бинарные task.md колонки → доли (mean)
+# task.md бинарные колонки → доли (mean).
 _BINARY_COLS = [
-    "is_rooted_jailbroken", "is_emulator", "is_debugger_attached",
-    "developer_tools_enabled", "is_vpn_detected", "is_proxy_detected",
-    "biometric_entry_used",
+    "is_developer_tools", "is_headless_browser",
+    "is_incognito",
+    "is_vpn_detected", "is_proxy_detected", "is_tor_detected",
+    "is_new_device", "is_new_browser",
 ]
-# Числовые task.md колонки → mean
+
+# task.md числовые колонки → mean.
 _MEAN_COLS = [
-    "network_rtt_avg_ms", "accuracy_meters", "geo_speed_km_h",
-    "touch_typing_rhythm_cv", "touch_typing_rhythm_median_ms",
-    "touch_typing_rhythm_std_dev", "tap_velocity_avg",
-    "touch_jitter_score", "swipe_angle_deviation",
-    "clipboard_paste_ratio", "backspace_ratio", "form_fill_duration_sec",
-    "app_background_events", "screen_orientation_changes",
-    "accelerometer_variance_x", "accelerometer_variance_y", "gyroscope_variance",
-    "battery_level", "storage_free_percent",
+    "network_rtt_avg_ms",
+    "mouse_velocity_avg", "mouse_acceleration_avg",
+    "mouse_jitter_score", "mouse_linearity_score",
+    "click_duration_avg_ms", "right_click_count", "scroll_velocity_avg",
+    "keyboard_typing_speed_median_ms", "keyboard_typing_speed_std_dev",
+    "keyboard_typing_rhythm_cv",
+    "backspace_ratio", "clipboard_paste_ratio",
+    "copy_events_count", "paste_events_count",
+    "tab_switch_count", "focus_blur_count",
+    "form_fill_duration_sec", "idle_time_before_submit_sec",
+    "error_correction_ratio", "hover_time_avg_ms",
+    "double_click_count", "drag_drop_events",
+    "resize_events_count", "zoom_level",
+    "session_duration_sec", "pages_visited_count",
+    "installed_fonts_count",
+    "failed_login_attempts", "time_since_last_login_sec",
+    "device_trust_score",
 ]
 
 FEATURE_COLUMNS = [
     # Amount
     "event_count", "amt_mean", "amt_std", "amt_max", "amt_log_mean",
-    # Attestation / security shares
-    "is_rooted_share", "is_emulator_share", "is_debugger_share",
-    "developer_tools_share", "biometric_share",
-    "attestation_failed_share", "integrity_fail_share", "sideload_share",
+    # Binary shares
+    "dev_tools_share", "headless_share", "incognito_share",
+    "vpn_share", "proxy_share", "tor_share",
+    "new_device_share", "new_browser_share",
     # Network
-    "vpn_share", "proxy_share", "mean_rtt", "foreign_sim_share",
-    # Geo
-    "mean_geo_speed", "mean_accuracy",
-    # Biometrics (averages)
-    "mean_typing_cv", "mean_typing_median_ms", "mean_typing_std",
-    "mean_tap_velocity", "mean_jitter", "mean_swipe_angle",
-    "mean_clipboard_paste", "mean_backspace", "mean_form_fill",
-    "mean_app_background", "mean_orientation",
-    "mean_accel_x", "mean_accel_y", "mean_gyro",
-    # Device state
-    "mean_battery", "mean_storage_free", "charging_24_7_share",
+    "mean_rtt",
+    # Mouse biometrics
+    "mean_mouse_velocity", "mean_mouse_accel",
+    "mean_mouse_jitter", "mean_mouse_linearity",
+    # Click / scroll
+    "mean_click_duration", "mean_right_clicks", "mean_scroll_velocity",
+    # Keyboard
+    "mean_typing_median_ms", "mean_typing_std", "mean_typing_cv",
+    # Clipboard / form
+    "mean_backspace", "mean_clipboard_paste",
+    "mean_copy_events", "mean_paste_events",
+    "mean_tab_switch", "mean_focus_blur",
+    "mean_form_fill", "mean_idle_before_submit",
+    "mean_error_correction", "mean_hover_time",
+    "mean_double_click", "mean_drag_drop",
+    "mean_resize_events", "mean_zoom_level",
+    # Session shape
+    "mean_session_duration", "mean_pages_visited",
+    # Fonts
+    "mean_installed_fonts",
+    # Login / trust
+    "mean_failed_logins", "mean_time_since_login", "mean_device_trust",
+    # Categorical-derived shares
+    "foreign_isp_share", "mobile_os_share",
     # Temporal
     "hours_span", "night_ops_share", "weekend_share",
 ]
 
 _READ_COLS = [
     "customer_id", "event_dttm", "operaton_amt",
-    "attestation_status", "integrity_token", "app_install_source",
-    "battery_charging_state", "sim_country_code",
+    "os_type", "isp_name",
 ] + _BINARY_COLS + _MEAN_COLS
+
+# Иностранные ISP — те же что в feature_generator (для согласованности).
+_FOREIGN_ISP_SET = {
+    "Vodafone DE", "T-Mobile DE", "Orange FR", "China Mobile", "China Telecom",
+    "AT&T", "Comcast", "Kcell", "Beltelecom", "Turk Telekom",
+}
+_MOBILE_OS_SET = {"Android", "iOS"}
 
 
 def _prepare_batch(df: pd.DataFrame) -> pd.DataFrame:
@@ -76,29 +109,17 @@ def _prepare_batch(df: pd.DataFrame) -> pd.DataFrame:
         else:
             df[col] = np.float32(0.0)
 
-    # Derived shares
-    if "attestation_status" in df.columns:
-        df["_attestation_failed"] = (df["attestation_status"].fillna("passed") != "passed").astype(np.float32)
+    # Categorical-derived shares.
+    if "isp_name" in df.columns:
+        df["_foreign_isp"] = df["isp_name"].fillna("").isin(_FOREIGN_ISP_SET).astype(np.float32)
     else:
-        df["_attestation_failed"] = np.float32(0.0)
-    if "integrity_token" in df.columns:
-        df["_integrity_fail"] = df["integrity_token"].fillna("pass").isin(["fail", "missing"]).astype(np.float32)
+        df["_foreign_isp"] = np.float32(0.0)
+    if "os_type" in df.columns:
+        df["_mobile_os"] = df["os_type"].fillna("").isin(_MOBILE_OS_SET).astype(np.float32)
     else:
-        df["_integrity_fail"] = np.float32(0.0)
-    if "app_install_source" in df.columns:
-        df["_sideload"] = (df["app_install_source"].fillna("official") == "sideload").astype(np.float32)
-    else:
-        df["_sideload"] = np.float32(0.0)
-    if "sim_country_code" in df.columns:
-        df["_foreign_sim"] = (df["sim_country_code"].fillna("RU") != "RU").astype(np.float32)
-    else:
-        df["_foreign_sim"] = np.float32(0.0)
-    if "battery_charging_state" in df.columns:
-        df["_charging_24_7"] = (df["battery_charging_state"].fillna("discharging") == "plugged_24_7").astype(np.float32)
-    else:
-        df["_charging_24_7"] = np.float32(0.0)
+        df["_mobile_os"] = np.float32(0.0)
 
-    # Temporal
+    # Temporal.
     dt = pd.to_datetime(df["event_dttm"], errors="coerce")
     hour = dt.dt.hour.fillna(12).astype(np.int16)
     dow = dt.dt.dayofweek.fillna(0).astype(np.int16)
@@ -114,8 +135,7 @@ _SUM_COLS_FROM_BATCH = (
     ["operaton_amt", "_amt_sq", "_amt_log"]
     + _BINARY_COLS
     + _MEAN_COLS
-    + ["_attestation_failed", "_integrity_fail", "_sideload",
-       "_foreign_sim", "_charging_24_7", "_is_night", "_is_weekend"]
+    + ["_foreign_isp", "_mobile_os", "_is_night", "_is_weekend"]
 )
 
 
@@ -164,48 +184,68 @@ class CustomerAggregator:
         out["amt_max"] = self._max_amt.reindex(out.index).fillna(0.0)
         out["amt_log_mean"] = self._sums["_amt_log"] / n
 
-        # Бинарные task.md → доли
-        out["is_rooted_share"] = self._sums["is_rooted_jailbroken"] / n
-        out["is_emulator_share"] = self._sums["is_emulator"] / n
-        out["is_debugger_share"] = self._sums["is_debugger_attached"] / n
-        out["developer_tools_share"] = self._sums["developer_tools_enabled"] / n
-        out["biometric_share"] = self._sums["biometric_entry_used"] / n
-        out["attestation_failed_share"] = self._sums["_attestation_failed"] / n
-        out["integrity_fail_share"] = self._sums["_integrity_fail"] / n
-        out["sideload_share"] = self._sums["_sideload"] / n
-
-        # Network
+        # Binary shares.
+        out["dev_tools_share"] = self._sums["is_developer_tools"] / n
+        out["headless_share"] = self._sums["is_headless_browser"] / n
+        out["incognito_share"] = self._sums["is_incognito"] / n
         out["vpn_share"] = self._sums["is_vpn_detected"] / n
         out["proxy_share"] = self._sums["is_proxy_detected"] / n
+        out["tor_share"] = self._sums["is_tor_detected"] / n
+        out["new_device_share"] = self._sums["is_new_device"] / n
+        out["new_browser_share"] = self._sums["is_new_browser"] / n
+
+        # Network.
         out["mean_rtt"] = self._sums["network_rtt_avg_ms"] / n
-        out["foreign_sim_share"] = self._sums["_foreign_sim"] / n
 
-        # Geo
-        out["mean_geo_speed"] = self._sums["geo_speed_km_h"] / n
-        out["mean_accuracy"] = self._sums["accuracy_meters"] / n
+        # Mouse.
+        out["mean_mouse_velocity"] = self._sums["mouse_velocity_avg"] / n
+        out["mean_mouse_accel"] = self._sums["mouse_acceleration_avg"] / n
+        out["mean_mouse_jitter"] = self._sums["mouse_jitter_score"] / n
+        out["mean_mouse_linearity"] = self._sums["mouse_linearity_score"] / n
 
-        # Biometrics
-        out["mean_typing_cv"] = self._sums["touch_typing_rhythm_cv"] / n
-        out["mean_typing_median_ms"] = self._sums["touch_typing_rhythm_median_ms"] / n
-        out["mean_typing_std"] = self._sums["touch_typing_rhythm_std_dev"] / n
-        out["mean_tap_velocity"] = self._sums["tap_velocity_avg"] / n
-        out["mean_jitter"] = self._sums["touch_jitter_score"] / n
-        out["mean_swipe_angle"] = self._sums["swipe_angle_deviation"] / n
-        out["mean_clipboard_paste"] = self._sums["clipboard_paste_ratio"] / n
+        # Click / scroll.
+        out["mean_click_duration"] = self._sums["click_duration_avg_ms"] / n
+        out["mean_right_clicks"] = self._sums["right_click_count"] / n
+        out["mean_scroll_velocity"] = self._sums["scroll_velocity_avg"] / n
+
+        # Keyboard.
+        out["mean_typing_median_ms"] = self._sums["keyboard_typing_speed_median_ms"] / n
+        out["mean_typing_std"] = self._sums["keyboard_typing_speed_std_dev"] / n
+        out["mean_typing_cv"] = self._sums["keyboard_typing_rhythm_cv"] / n
+
+        # Clipboard / form interactions.
         out["mean_backspace"] = self._sums["backspace_ratio"] / n
+        out["mean_clipboard_paste"] = self._sums["clipboard_paste_ratio"] / n
+        out["mean_copy_events"] = self._sums["copy_events_count"] / n
+        out["mean_paste_events"] = self._sums["paste_events_count"] / n
+        out["mean_tab_switch"] = self._sums["tab_switch_count"] / n
+        out["mean_focus_blur"] = self._sums["focus_blur_count"] / n
         out["mean_form_fill"] = self._sums["form_fill_duration_sec"] / n
-        out["mean_app_background"] = self._sums["app_background_events"] / n
-        out["mean_orientation"] = self._sums["screen_orientation_changes"] / n
-        out["mean_accel_x"] = self._sums["accelerometer_variance_x"] / n
-        out["mean_accel_y"] = self._sums["accelerometer_variance_y"] / n
-        out["mean_gyro"] = self._sums["gyroscope_variance"] / n
+        out["mean_idle_before_submit"] = self._sums["idle_time_before_submit_sec"] / n
+        out["mean_error_correction"] = self._sums["error_correction_ratio"] / n
+        out["mean_hover_time"] = self._sums["hover_time_avg_ms"] / n
+        out["mean_double_click"] = self._sums["double_click_count"] / n
+        out["mean_drag_drop"] = self._sums["drag_drop_events"] / n
+        out["mean_resize_events"] = self._sums["resize_events_count"] / n
+        out["mean_zoom_level"] = self._sums["zoom_level"] / n
 
-        # Device state
-        out["mean_battery"] = self._sums["battery_level"] / n
-        out["mean_storage_free"] = self._sums["storage_free_percent"] / n
-        out["charging_24_7_share"] = self._sums["_charging_24_7"] / n
+        # Session shape.
+        out["mean_session_duration"] = self._sums["session_duration_sec"] / n
+        out["mean_pages_visited"] = self._sums["pages_visited_count"] / n
 
-        # Temporal
+        # Fonts.
+        out["mean_installed_fonts"] = self._sums["installed_fonts_count"] / n
+
+        # Login / trust.
+        out["mean_failed_logins"] = self._sums["failed_login_attempts"] / n
+        out["mean_time_since_login"] = self._sums["time_since_last_login_sec"] / n
+        out["mean_device_trust"] = self._sums["device_trust_score"] / n
+
+        # Categorical-derived.
+        out["foreign_isp_share"] = self._sums["_foreign_isp"] / n
+        out["mobile_os_share"] = self._sums["_mobile_os"] / n
+
+        # Temporal.
         out["hours_span"] = ((self._max_ts - self._min_ts) / 3600.0).reindex(out.index).fillna(0.0).clip(lower=0.0)
         out["night_ops_share"] = self._sums["_is_night"] / n
         out["weekend_share"] = self._sums["_is_weekend"] / n

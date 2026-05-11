@@ -16,7 +16,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .generators import NEW_COLUMNS, generate_features
+from .generators import TASK_COLUMNS, generate_features
 
 # Approx rows per pyarrow batch; bounded by row-group size in the source file.
 DEFAULT_BATCH_ROWS = 200_000
@@ -38,8 +38,9 @@ def _augment_batch(
     else:
         target = None
 
-    new_cols = generate_features(batch_df, target, seed=seed)
-    return pd.concat([batch_df.reset_index(drop=True), new_cols.reset_index(drop=True)], axis=1)
+    # generate_features now returns the full task.md schema (71 columns),
+    # already including identity / transaction / temporal passthroughs.
+    return generate_features(batch_df, target, seed=seed).reset_index(drop=True)
 
 
 def _load_labels(labels_path: Path | None) -> Optional[dict]:
