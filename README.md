@@ -91,11 +91,6 @@ cp data/train_labels.parquet ~/fraud/labels/dt=legacy/
 python3 -m orchestration.daily_flow
 ```
 
-**⚠ Известный баг:** subprocess-вызовы в `daily_flow.py` пишут вывод
-`aggregate`/`extract` в `data_augmented/`, перезаписывая baseline
-`customer_features.parquet` (100K клиентов) и `labelled_events.parquet`
-(87K событий). До исправления — делать backup перед запуском daily_flow.
-
 ## Структура
 
 ```
@@ -147,12 +142,10 @@ AntiFraudMLWeb/
    AUC-gate каждый день отвергает идентичную модель — реального
    ML-сигнала нет до подключения хотя бы одного источника.
 3. **`/admin/reload-model`** в AntiFraudMain — без него `daily_flow.notify`
-   падает после промоушена.
-4. **Fix daily_flow output paths** — вынести `customer_features.parquet`/
-   `labelled_events.parquet` из `data_augmented/` в `~/fraud/work/`.
-5. **Frontend SDK биометрики** — собирать mouse/keyboard/canvas, без них
+   падает после промоушена. См. `AntiFraudMain/todo.md` #2.
+4. **Frontend SDK биометрики** — собирать mouse/keyboard/canvas, без них
    55 task.md полей всегда NaN.
-6. **Time-based валидация и aggregate без утечки** — см. `CLAUDE.md`
+5. **Time-based валидация и aggregate без утечки** — см. `CLAUDE.md`
    «Дальнейшие улучшения».
 
 ## Лицензия / контекст

@@ -343,26 +343,32 @@ prefect worker start --pool default &
 python3 -m orchestration.daily_flow
 ```
 
-### ⚠ Известные баги daily_flow
+### Поведение daily_flow (бывшие баги, теперь исправлены)
 
-1. **Overwrites baseline в `data_augmented/`.** `daily_flow.run_aggregate` /
-   `run_extract` вызывают `trainer.cli` без `--input`, поэтому используется
-   дефолт `data_augmented`, и `customer_features.parquet` /
-   `labelled_events.parquet` пишутся туда, перезаписывая исходный baseline
-   (100 K customers, 87 K labelled events). До исправления — делать
-   backup или менять дефолт в `_do_aggregate`/`_do_extract`.
+1. **Outputs не трогают baseline.** `aggregate`/`extract` пишут в
+   `--work-dir` (default `~/fraud/work/` через `FlowConfig`); CLI
+   `--work-dir` отделён от `--input`. `data_augmented/customer_features.parquet`
+   и `labelled_events.parquet` остаются нетронутыми.
 
-2. **Падает на пустом `~/fraud/events/`.** `compute_data_hash` отрабатывает
-   на пустом globe, но `run_extract` падает с "No labelled events found"
-   если в events лежит только test.parquet (у него по определению нет
-   меток). Решение для bootstrap'а — скопировать в events `train_part_*`
-   с реальными метками.
+2. **Graceful на пустых лейблах.** Если extract не нашёл матчей,
+   пишется пустой parquet с правильной схемой + warning в лог; train
+   скипается (`run_train` проверяет `num_rows == 0` перед запуском);
+   flow завершается с `decision={"reason": "no_new_labels"}` без падения.
 
-3. **Тренировка с нуля, не fine-tuning.** `_train_impl` создаёт свежий
-   `FraudMLP(...)` без `model.load_state_dict(previous_best.pt)`. Если
-   нужен warm-start между runs — реализовать отдельно. Это означает,
-   что `data_augmented/*.parquet` НЕ переиспользуется автоматически —
-   trainer видит только то, что лежит в текущих outputs aggregate/extract.
+3. **Warm-start опционален.** По умолчанию `_train_impl` создаёт
+   свежий `FraudMLP(...)`. Флаг `--warm-start-from <path|models:/...>`
+   включает `load_state_dict(state, strict=False)` перед обучением.
+   В daily_flow не используется (cold-start каждый день — намеренно,
+   чтобы избежать накопления дрифта).
+
+### Параллельный mobile flow
+
+`AntiFraudMLMobile` имеет идентичный `orchestration/` со своими
+defaults: `events_mobile/`, `labels_mobile/`, `work_mobile/`,
+`fraud_mlp_mobile` в Registry, cron `0 4 * * *` (на час позже web,
+чтобы RTX 4060 не делила GPU). Общий MLFlow tracking server
+(`~/fraud/mlruns/`), разные experiment'ы и registered models — без
+пересечений.
 
 ## Окружение
 
