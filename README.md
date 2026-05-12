@@ -100,36 +100,36 @@ python3 -m orchestration.daily_flow
 
 ```
 AntiFraudMLWeb/
-├── data/                   # сырые parquet'ы (под DVC), train_labels, sample_submit
-├── data_augmented/         # 8 augmented parquet'ов (71 task.md колонка, под DVC)
-│   ├── *.parquet
-│   ├── customer_features.parquet     # 100 K customers × 49 агрегатов
-│   ├── customer_features.state.parquet  # raw sums для incremental aggregate
-│   └── labelled_events.parquet       # 87 514 размеченных × 72 колонки
+├── data/                   # сырые parquet'ы — train_labels, sample_submit
+├── data_augmented/         # 8 augmented parquet'ов (71 task.md колонка)
+│   ├── *.parquet           # часть из них перенесена в ~/fraud/events/dt=0000-00-00/
+│   ├── customer_features.parquet     # 100 K customers × 49 агрегатов (output legacy aggregate)
+│   └── labelled_events.parquet       # 87 514 размеченных × 72 колонки (output legacy extract)
 ├── feature_generator/      # dev/CI: синтез 71 колонки task.md
 ├── trainer/                # aggregate / extract / train / pyfunc
 │   ├── checkpoints/        # best.pt + metrics.json
 │   ├── pyfunc.py           # FraudPyfunc — обёртка для MLFlow log_model
 │   └── ...
 ├── orchestration/          # Prefect daily flow + promote + notify
-├── dvc.yaml, params.yaml   # DVC pipeline
-├── .dvc/                   # cache + config (cache.type=hardlink)
 ├── predict_example.py      # [DEPRECATED] dev/debug local inference
 ├── predict_from_json.py    # [DEPRECATED] JSON inference
 ├── task.md                 # ЦЕЛЕВАЯ схема (71 колонка) — data dictionary
 ├── DATA.md                 # детальное описание данных
 ├── CLAUDE.md               # карта проекта для контекстных ассистентов
-├── update.md               # MLOps-обсуждение (MLFlow / Prefect / DVC)
+├── update.md               # MLOps-обсуждение (MLFlow / Prefect)
 └── README.md               # этот файл
 ```
 
 ## Окружение
 
 - Python 3.14, PyTorch 2.9 + CUDA, pandas 2.3, pyarrow 23.0, numpy 2.4
-- mlflow 3.12, prefect 3.7, dvc 3.67 — установлены в `~/.local`
+- mlflow 3.12, prefect 3.7 — установлены в `~/.local`
 - GPU: NVIDIA RTX 4060 Laptop, 8 GB VRAM
-- Shared dev paths: `~/fraud/{events,labels,state,mlruns,dvc-cache}`
+- Shared dev paths: `~/fraud/{events,labels,state,mlruns,work}`
 - Production canonical (требует sudo): `/var/fraud/...`
+- Reproducibility — через `compute_data_hash` (SHA256 от path+size+mtime
+  входных файлов), логируется как MLFlow run tag. См. секцию «Что дальше»
+  если интересует история DVC-эксперимента.
 
 ## Что дальше
 
@@ -139,13 +139,20 @@ AntiFraudMLWeb/
    в `~/fraud/events/dt=YYYY-MM-DD/part-*.parquet`. См.
    `AntiFraudMain/update.md` (раздел Schema gap) + плановый раздел в
    `update.md` (Architecture).
-2. **`/admin/reload-model`** в AntiFraudMain — без него `daily_flow.notify`
+2. **Источник лейблов** — наполнять `~/fraud/labels/dt=YYYY-MM-DD/part-*.parquet`
+   из внешних каналов: chargeback-фид от процессинга (лаг 1-30 дней),
+   выгрузка решений fraud-команды из CRM, customer complaints, ручные
+   отметки операторов. Без этого daily_flow на bootstrap'е переобучается
+   на статичных 87 514 парах из `data/train_labels.parquet` и
+   AUC-gate каждый день отвергает идентичную модель — реального
+   ML-сигнала нет до подключения хотя бы одного источника.
+3. **`/admin/reload-model`** в AntiFraudMain — без него `daily_flow.notify`
    падает после промоушена.
-3. **Fix daily_flow output paths** — вынести `customer_features.parquet`/
+4. **Fix daily_flow output paths** — вынести `customer_features.parquet`/
    `labelled_events.parquet` из `data_augmented/` в `~/fraud/work/`.
-4. **Frontend SDK биометрики** — собирать mouse/keyboard/canvas, без них
+5. **Frontend SDK биометрики** — собирать mouse/keyboard/canvas, без них
    55 task.md полей всегда NaN.
-5. **Time-based валидация и aggregate без утечки** — см. `CLAUDE.md`
+6. **Time-based валидация и aggregate без утечки** — см. `CLAUDE.md`
    «Дальнейшие улучшения».
 
 ## Лицензия / контекст

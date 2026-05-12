@@ -69,7 +69,6 @@ AntiFraudMLWeb/
 │   ├── promote.py                 # AUC-gate перед Production
 │   ├── notify.py                  # POST /admin/reload-model в AntiFraudMain
 │   └── config.py                  # env-driven параметры
-├── dvc.yaml, params.yaml, .dvc/   # DVC pipeline + remote
 ├── predict_example.py             # [DEPRECATED] локальный inference c best.pt
 ├── predict_from_json.py           # [DEPRECATED] JSON-инференс
 ├── predict_input_example.json     # Демо payload (web-fraud схема)
@@ -77,7 +76,7 @@ AntiFraudMLWeb/
 ├── submission.csv                 # Результат инференса по test.parquet
 ├── task.md                        # ЦЕЛЕВАЯ схема (71 колонка)
 ├── DATA.md                        # Описание исходных данных
-├── update.md                      # MLOps-обсуждение (MLFlow/Prefect/DVC)
+├── update.md                      # MLOps-обсуждение (MLFlow / Prefect)
 └── CLAUDE.md                      # Этот файл
 ```
 
@@ -285,7 +284,7 @@ python3 -m trainer.cli extract \
 python3 -m trainer.cli train \
   --mlflow-uri file:///var/fraud/mlruns \
   --registered-model-name fraud_mlp_web \
-  --data-hash $(dvc status --json | sha256sum | head -c 16)
+  --data-hash $(date +%Y%m%d)-bootstrap
 ```
 
 ## Этап 3 — predict (DEPRECATED)
@@ -306,28 +305,30 @@ Registry (`models:/fraud_mlp_web/Production`). См. `update.md` раздел 3.
 - `test3_collision.json` — «чистый» клиент с подозрительным событием
   (проверка, перетягивает ли история вердикт).
 
-## Этап 4 — daily retrain (Prefect / DVC / MLFlow)
+## Этап 4 — daily retrain (Prefect + MLFlow)
 
 Ежедневный flow живёт в `orchestration/`. Запускается Prefect-агентом по
 cron'у (по умолчанию 03:00 Europe/Moscow). Шаги:
 
 1. `compute_data_hash` — отпечаток входных файлов (sha256 от path/size/mtime).
+   Идёт как MLFlow run tag `data_hash`, привязывает модель к версии данных.
 2. `run_aggregate` — `python -m trainer.cli aggregate --incremental ...`.
    Не пересобирает 108 M строк, дописывает только новые партиции.
+   Идемпотентен по `(path, size, mtime)` — повторный запуск пропускает
+   уже обработанные файлы.
 3. `run_extract` — окно меток `[today-30d, today-7d]` (лаг чарджбэков).
+   `--append` режим аккумулирует размеченные события между запусками.
 4. `run_train` — обучение + MLFlow run + `mlflow.pyfunc.log_model(...)`
-   с регистрацией в Registry под именем `fraud_mlp_web`.
+   с регистрацией в Registry под именем `fraud_mlp_web`. Пропускается
+   если `labelled_events.parquet` пустой (нет новых меток).
 5. `run_promote` — `validate_and_promote` в `orchestration/promote.py`:
    новая версия становится Production только если `val_auc ≥ prod_auc − 0.005`.
 6. `run_notify` — POST `/admin/reload-model` в AntiFraudMain. Бэкенд
    подтягивает новую модель из Registry без рестарта.
 
 Все пути и URL — env-driven (см. `orchestration/config.py`):
-`FRAUD_ROOT`, `FRAUD_EVENTS_GLOB`, `MLFLOW_TRACKING_URI`,
+`FRAUD_ROOT`, `FRAUD_EVENTS_GLOB`, `FRAUD_WORK_DIR`, `MLFLOW_TRACKING_URI`,
 `FRAUD_BACKEND_RELOAD_URL`, `FRAUD_CRON`, `FRAUD_CRON_TZ`, и т.д.
-
-DVC pipeline (`dvc.yaml` + `params.yaml`) дублирует те же стадии для
-ручного `dvc repro` — пропускает шаги, у которых deps не менялись.
 
 ### Запуск daily flow
 
@@ -367,16 +368,17 @@ python3 -m orchestration.daily_flow
 
 - Python 3.14, pandas 2.3.3 (downgraded mlflow constraint), pyarrow 23.0.1,
   numpy 2.4.4, torch 2.9.1+cu130
-- mlflow 3.12, prefect 3.7, dvc 3.67 — установлены в ~/.local
+- mlflow 3.12, prefect 3.7 — установлены в ~/.local
 - GPU: NVIDIA RTX 4060 Laptop, 8.2 GB VRAM, CUDA available
 - Project root: `/home/clever/Documents/AntiFraud/AntiFraudMLWeb`
-- **Shared data root (dev):** `/home/clever/fraud/` — events, labels, state,
-  mlruns, dvc-cache. Override через `FRAUD_ROOT` env var.
+- **Shared data root (dev):** `/home/clever/fraud/` — events, labels,
+  state, mlruns, work. Override через `FRAUD_ROOT` env var.
 - **Production canonical:** `/var/fraud/` (требует sudo на этой машине).
   Все примеры в коде используют `/var/fraud/` как иллюстрацию; реальные
-  дефолты в `params.yaml` / `.dvc/config` / `orchestration/config.py`
-  указывают на `/home/clever/fraud/`.
-- Никаких внешних БД нет — всё на parquet'ах в файловой системе
+  дефолты в `orchestration/config.py` указывают на `/home/clever/fraud/`.
+- Никаких внешних БД нет — всё на parquet'ах в файловой системе.
+- DVC экспериментально подключался, потом удалён — для single-host setup
+  избыточен; reproducibility покрывает `compute_data_hash` + MLFlow tags.
 
 ## Подводные камни (gotchas)
 
@@ -402,7 +404,6 @@ python3 -m orchestration.daily_flow
 ### Сделано
 
 - **MLFlow tracking + Model Registry** — `trainer/train.py` + `trainer/pyfunc.py`.
-- **DVC pipeline** — `dvc.yaml` + `params.yaml`.
 - **Prefect daily flow** — `orchestration/daily_flow.py`.
 - **Validation gate перед Production** — `orchestration/promote.py`.
 - **Hot-reload модели в бэкенде** — `orchestration/notify.py` →
