@@ -134,6 +134,8 @@ def _prepare_batch(df: pd.DataFrame) -> pd.DataFrame:
     df["_is_night"] = ((hour >= 0) & (hour < 6)).astype(np.float32)
     df["_is_weekend"] = (dow >= 5).astype(np.float32)
     valid = dt.notna().to_numpy()
+    if dt.dt.tz is not None:
+        dt = dt.dt.tz_convert("UTC").dt.tz_localize(None)
     sec_dt = dt.astype("datetime64[s]", copy=False).to_numpy().view("int64")
     df["_ts"] = np.where(valid, sec_dt, np.nan).astype(np.float64)
     return df
